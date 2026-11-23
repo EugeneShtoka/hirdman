@@ -510,6 +510,49 @@ func TestUpdateKeepsSession(t *testing.T) {
 	}
 }
 
+// Closing a task with Jira keys runs the agent in its folder to move them on; one without keys runs nothing.
+func TestCloseChecksJira(t *testing.T) {
+	dir := t.TempDir()
+	fake := "#!/bin/sh\npwd > " + dir + "/ran; printf '%s' \"$2\" > " + dir + "/prompt\necho '{\"type\":\"result\",\"result\":\"BE-1: QA - Staging, moved\"}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "agent"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: filepath.Join(dir, "agent"), areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"j":  {ID: "j", Title: "Fix it", Area: "work", Status: "waiting", Jira: []string{"BE-1"}},
+		"no": {ID: "no", Area: "work", Status: "waiting"},
+	}
+	mux := b.routes()
+	for _, id := range []string{"no", "j"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/tasks/"+id+"?actor=eugene", strings.NewReader(`{"status":"done"}`)))
+		if rec.Code != 200 {
+			t.Fatalf("close %s: %d", id, rec.Code)
+		}
+	}
+	last := func() Entry {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		h := b.st.Tasks["j"].History
+		return h[len(h)-1]
+	}
+	for i := 0; i < 100 && last().Kind != "qa"; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if e := last(); e.Actor != "agent" || e.Text != "BE-1: QA - Staging, moved" {
+		t.Errorf("last entry = %+v, want the agent's Jira report", e)
+	}
+	if ran, _ := os.ReadFile(filepath.Join(dir, "ran")); strings.TrimSpace(string(ran)) != dir {
+		t.Errorf("agent ran in %q, want the area's folder %q", ran, dir)
+	}
+	if prompt, _ := os.ReadFile(filepath.Join(dir, "prompt")); !strings.Contains(string(prompt), "now: BE-1.") {
+		t.Errorf("prompt %q doesn't name BE-1", prompt)
+	}
+	if h := b.st.Tasks["no"].History; slices.ContainsFunc(h, func(e Entry) bool { return e.Kind == "qa" }) {
+		t.Errorf("a task without Jira keys got a check: %+v", h)
+	}
+}
+
 func TestSessionHook(t *testing.T) {
 	dir := t.TempDir()
 	// A fake wezterm: pane 7 is t1's session; every other call is logged.
