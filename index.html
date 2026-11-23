@@ -732,11 +732,12 @@ function setTheme(t) {
   if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   try { if (t) localStorage.setItem("theme", t); else localStorage.removeItem("theme"); } catch {}
 }
-// Settings by category: [key, label, hint, kind]. The board's are its HIRDMAN_* settings, saved over the service's env
-// (saving restarts the board); kind is text (default), projects, check, ro (shown only) or a list of choices; "" is the first.
+// Settings by category: [key, label, hint, kind]. The board's are its config.toml settings, by the HIRDMAN_* env var that wins
+// over each (saving writes the file and restarts the board); kind is text (default), projects, check, ro (shown only) or a list
+// of choices; "" is the first.
 // The board-wide values below the projects are the defaults a project without its own takes.
 const SETTINGS = [
-  ["Projects", [["HIRDMAN_AREAS", "Projects", "Work is required: the brief runs in it.", "projects"]]],
+  ["Projects", [["HIRDMAN_AREAS", "Projects", "A project's runs, what its brief is, are set in config.toml; one with none set is briefed from its roadmap files.", "projects"]]],
   ["Briefs", [["HIRDMAN_BRIEF_EVERY", "Brief every", "How often a project without its own is briefed, e.g. 6h; empty is only by the button."]]],
   ["Watchers", [["HIRDMAN_JIRA_POLL", "Jira feed poll", "Empty is 2m."], ["HIRDMAN_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
     ["HIRDMAN_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."], ["HIRDMAN_KITH_MCP", "kith MCP command", "Empty is kith-mcp."]]],
@@ -746,20 +747,21 @@ const SETTINGS = [
   ["Links", [["HIRDMAN_ISSUE_URL", "Issue link base", "For projects without their own; an issue key is appended, e.g. https://you.atlassian.net/browse/."],
     ["HIRDMAN_PR_URL", "Pull request link base", "For projects without their own; a #number is appended."]]],
   ["Server", [["HIRDMAN_URL", "Board URL", "How the agent reaches the board; empty is http://localhost and the address."],
-    ["HIRDMAN_ADDR", "Address", "Set in the service's env only.", "ro"], ["HIRDMAN_STATE", "State file", "Set in the service's env only; settings.json sits next to it.", "ro"]]],
+    ["HIRDMAN_ADDR", "Address", "Set in the service's env only.", "ro"], ["HIRDMAN_STATE", "State file", "Set in the service's env only.", "ro"],
+    ["HIRDMAN_CONFIG", "Config file", "Set in the service's env only; these settings are saved in it.", "ro"]]],
 ];
-// A project's fields, HIRDMAN_AREAS keys: [key, label, hint]. Roadmap is a list, edited comma-separated.
+// A project's fields, config.toml's [[areas]] keys: [key, label, hint]. Roadmap is a list, edited comma-separated.
 const PROJECT = [["id", "Id", "Stored on its tasks: lowercase, unique, e.g. kith."], ["name", "Name", "Shown on the board; empty is the id."],
   ["dir", "Folder", "Where its sessions run, e.g. ~/dev/kith."],
   ["roadmap", "Roadmap files", "Globs in the folder, comma-separated; empty is roadmap.md, TODO.md and the like; none reads no files."],
   ["jiraRoom", "Jira feed room", "The kith room its Jira bot posts in; empty watches none."],
   ["briefEvery", "Brief every", "e.g. 6h; empty is the board's below; 0 is only by the button."],
   ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is its folder's GitHub origin, else the board's below."]];
-let projects = [], projectsRaw = "", projectsLoaded = "";
+let projects = [];
 const projectHTML = (p, i) => `<fieldset class="proj" data-proj="${i}"><legend>${esc(p.name || p.id || "New project")}</legend>
   ${PROJECT.map(([k, label, hint]) => { const v = k === "roadmap" ? (Array.isArray(p[k]) ? p[k].join(", ") || "none" : "") : p[k] || "";
     return `<label for="p${i}-${k}">${label}<input type="text" id="p${i}-${k}" data-pk="${k}" value="${esc(v)}" spellcheck="false"><span class="hint">${hint}</span></label>`; }).join("")}
-  ${p.id === "work" ? "" : `<div class="btns"><button type="button" class="btn danger" data-unproj="${i}">Remove ${esc(p.name || p.id || "project")}</button></div>`}</fieldset>`;
+  <div class="btns"><button type="button" class="btn danger" data-unproj="${i}">Remove ${esc(p.name || p.id || "project")}</button></div></fieldset>`;
 // The fields over the projects as loaded, so keys the form doesn't edit are kept; an empty field leaves its key out.
 const readProjects = () => [...document.querySelectorAll("[data-proj]")].map((f) => {
   const p = { ...projects[+f.dataset.proj] };
@@ -785,19 +787,18 @@ async function renderSettings() {
   const r = await fetch("api/settings").catch(() => null);
   const { settings: now = {}, env = {} } = r && r.ok ? await r.json() : {};
   const field = ([k, label, hint, kind]) => {
-    const v = now[k] || "", id = "s-" + k, on = kind !== "ro" && v !== (env[k] || "");
+    // A setting the service's env sets wins over the file, so it is shown only.
+    const v = now[k] || "", id = "s-" + k, byEnv = kind !== "ro" && kind !== "projects" && !!env[k], ro = kind === "ro" || byEnv;
     if (kind === "projects") {
-      projectsRaw = v;
-      try { projects = JSON.parse(v); } catch { projects = []; }
-      projectsLoaded = JSON.stringify(projects);
+      try { projects = JSON.parse(v) || []; } catch { projects = []; }
       return `<div id="s-projects" style="display:grid;gap:0.875rem">${projects.map(projectHTML).join("")}</div>
         <div class="btns"><button type="button" class="btn" id="s-add">Add project</button></div>
-        <span class="hint">${esc(hint)}${on ? " Set here; the env file has others." : ""}</span>`;
+        <span class="hint">${esc(hint)}</span>`;
     }
-    const input = kind === "check" ? `<input type="checkbox" id="${id}" data-key="${k}" ${v === "1" ? "checked" : ""}>`
-      : Array.isArray(kind) ? `<select id="${id}" data-key="${k}">${kind.map(([o, l]) => `<option value="${o}" ${o === v || !o && v === "tab" ? "selected" : ""}>${l}</option>`).join("")}</select>`
-      : `<input type="text" id="${id}" ${kind === "ro" ? "readonly" : `data-key="${k}"`} value="${esc(v)}">`;
-    return `<label for="${id}">${esc(label)} <code>${k}</code>${input}<span class="hint">${esc(hint)}${on ? ` Set here; the env file has ${env[k] ? `<code>${esc(env[k])}</code>` : "none"}.` : ""}</span></label>`;
+    const input = kind === "check" ? `<input type="checkbox" id="${id}" ${ro ? "disabled" : `data-key="${k}"`} ${v === "1" ? "checked" : ""}>`
+      : Array.isArray(kind) ? `<select id="${id}" ${ro ? "disabled" : `data-key="${k}"`}>${kind.map(([o, l]) => `<option value="${o}" ${o === v || !o && v === "tab" ? "selected" : ""}>${l}</option>`).join("")}</select>`
+      : `<input type="text" id="${id}" ${ro ? "readonly" : `data-key="${k}"`} value="${esc(v)}">`;
+    return `<label for="${id}">${esc(label)} <code>${k}</code>${input}<span class="hint">${esc(hint)}${byEnv ? " Set by the service's env, which wins over config.toml." : ""}</span></label>`;
   };
   $("dlg-body").innerHTML = `
     <div class="dlg-head"><h2 id="dlg-title">Settings</h2><button class="x" id="x" aria-label="Close">×</button></div>
@@ -813,9 +814,7 @@ async function renderSettings() {
 async function saveSettings(e) {
   e.preventDefault();
   const body = Object.fromEntries([...$("settings-form").querySelectorAll("[data-key]")].map((el) => [el.dataset.key, el.type === "checkbox" ? (el.checked ? "1" : "") : el.value]));
-  // Unchanged projects go back as loaded, so a save of other settings doesn't pin the env's list in settings.json.
-  const ps = JSON.stringify(readProjects());
-  body.HIRDMAN_AREAS = ps === projectsLoaded ? projectsRaw : ps;
+  body.HIRDMAN_AREAS = JSON.stringify(readProjects());
   const r = await fetch("api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   $("s-err").hidden = r && r.ok; $("s-ok").hidden = !(r && r.ok);
   if (r && r.ok) $("s-ok").textContent = "Saved. The board is restarting; the page picks it up in a few seconds.";

@@ -47,8 +47,8 @@ func TestRoadmap(t *testing.T) {
 	}
 	b := &Board{home: "/home", selfURL: "http://board"}
 	var err error
-	b.areas, err = b.parseAreas(`[{"id": "work", "dir": "` + empty + `", "roadmap": []}, {"id": "kith", "dir": "` + kith + `"},
-		{"id": "plans", "dir": "` + kith + `", "roadmap": ["*/roadmap.md", "ROADMAP.md", "planning/*.md", "["]}]`)
+	b.areas, err = b.parseAreas(areasOf(t, `[{"id": "work", "dir": "`+empty+`", "roadmap": []}, {"id": "kith", "dir": "`+kith+`"},
+		{"id": "plans", "dir": "`+kith+`", "roadmap": ["*/roadmap.md", "ROADMAP.md", "planning/*.md", "["]}]`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +72,16 @@ func TestRoadmap(t *testing.T) {
 	}
 }
 
+// areasOf decodes a JSON list of areas, as the settings page sends them.
+func areasOf(t *testing.T, s string) []Area {
+	t.Helper()
+	var areas []Area
+	if err := json.Unmarshal([]byte(s), &areas); err != nil {
+		t.Fatal(err)
+	}
+	return areas
+}
+
 func TestAreas(t *testing.T) {
 	work, kith := t.TempDir(), t.TempDir()
 	// work's folder is a GitHub repository: its #numbers are its own pull requests, not HIRDMAN_PR_URL's.
@@ -86,23 +96,29 @@ func TestAreas(t *testing.T) {
 	t.Setenv("HIRDMAN_BRIEF_EVERY", "6h") // an area without briefEvery's
 	t.Setenv("HIRDMAN_PR_URL", "https://env/pull/")
 	t.Setenv("HIRDMAN_ISSUE_URL", "")
-	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `", "briefEvery": "1h",
-		"issueUrl": "https://kith/issues/", "prUrl": "https://kith/pull/"},
-		{"id": "nixos", "dir": "~/dev/nixos"}, {"id": "personal", "name": "Personal", "dir": "~", "briefEvery": "0"}]`)
+	brief := []Run{{Name: "brief", Prompt: "Use the brief skill."}}
+	areas, err := b.parseAreas(areasOf(t, `[{"id": "work", "name": "Work", "dir": "`+work+`", "runs": [{"name": "brief", "prompt": "Use the brief skill."}]},
+		{"id": "kith", "name": "Kith", "dir": "`+kith+`", "briefEvery": "1h", "issueUrl": "https://kith/issues/", "prUrl": "https://kith/pull/"},
+		{"id": "nixos", "dir": "~/dev/nixos", "runs": []}, {"id": "personal", "name": "Personal", "dir": "~", "briefEvery": "0"}]`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", "", "https://github.com/o/work/pull/", 6 * time.Hour},
-		{"kith", "Kith", kith, defaultRoadmap, "", "1h", "https://kith/issues/", "https://kith/pull/", time.Hour},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, "", "", "", "https://env/pull/", 6 * time.Hour},
-		{"personal", "Personal", "/home", defaultRoadmap, "", "0", "", "https://env/pull/", 0}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, brief, "", "", "", "https://github.com/o/work/pull/", 6 * time.Hour},
+		{"kith", "Kith", kith, defaultRoadmap, defaultRuns, "", "1h", "https://kith/issues/", "https://kith/pull/", time.Hour},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, []Run{}, "", "", "", "https://env/pull/", 6 * time.Hour},
+		{"personal", "Personal", "/home", defaultRoadmap, defaultRuns, "", "0", "", "https://env/pull/", 0}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
-	for _, bad := range []string{``, `{}`, `[{"id": "Kith", "dir": "/"}]`, `[{"id": "work", "dir": "/"}, {"id": "work", "dir": "/"}]`,
-		`[{"name": "no id", "dir": "/"}]`, `[{"id": "work"}]`, `[{"id": "kith", "dir": "/"}]`,
-		`[{"id": "work", "dir": "/", "briefEvery": "daily"}]`} {
-		if _, err := b.parseAreas(bad); err == nil {
+	// No area is required, work included.
+	if got, err := b.parseAreas(nil); err != nil || len(got) != 0 {
+		t.Errorf("parseAreas(none) = %v, %v; want none", got, err)
+	}
+	for _, bad := range []string{`[{"id": "Kith", "dir": "/"}]`, `[{"id": "work", "dir": "/"}, {"id": "work", "dir": "/"}]`,
+		`[{"name": "no id", "dir": "/"}]`, `[{"id": "work"}]`, `[{"id": "work", "dir": "/", "briefEvery": "daily"}]`,
+		`[{"id": "a", "dir": "/", "runs": [{"name": "empty"}]}]`, `[{"id": "a", "dir": "/", "runs": [{"builtin": "sweep"}]}]`,
+		`[{"id": "a", "dir": "/", "runs": [{"prompt": "p", "builtin": "roadmap"}]}]`} {
+		if _, err := b.parseAreas(areasOf(t, bad)); err == nil {
 			t.Errorf("parseAreas(%s) took it", bad)
 		}
 	}
@@ -167,8 +183,8 @@ func TestHandleBriefRun(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(kith, "roadmap.md"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	b := &Board{wake: make(chan struct{}, 1), areas: []Area{{ID: "work"}, {ID: "kith", Dir: kith, Roadmap: defaultRoadmap},
-		{ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap}}}
+	b := &Board{wake: make(chan struct{}, 1), areas: []Area{{ID: "work", Runs: []Run{{Prompt: "brief"}}},
+		{ID: "kith", Dir: kith, Roadmap: defaultRoadmap, Runs: defaultRuns}, {ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap, Runs: defaultRuns}}}
 	run := func(body string) int {
 		rec := httptest.NewRecorder()
 		b.handleBriefRun(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/brief/run", strings.NewReader(body)))
@@ -195,8 +211,9 @@ func TestDueBriefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	b := &Board{areas: []Area{{ID: "work", every: 6 * time.Hour}, {ID: "personal", every: time.Hour}, {ID: "kith", Dir: kith, Roadmap: defaultRoadmap},
-		{ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap, every: time.Hour}}}
+	prompt := []Run{{Prompt: "brief"}}
+	b := &Board{areas: []Area{{ID: "work", Runs: prompt, every: 6 * time.Hour}, {ID: "personal", Runs: prompt, every: time.Hour},
+		{ID: "kith", Dir: kith, Roadmap: defaultRoadmap, Runs: defaultRuns}, {ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap, Runs: defaultRuns, every: time.Hour}}}
 	b.st.Brief = map[string]any{"at": now.Add(-time.Hour).Format(time.RFC3339)} // the brief work pushed counts as its last
 	b.st.Briefs = map[string]*Job{"personal": {StartedAt: now.Add(-2 * time.Hour)}}
 	if got := b.dueBriefs(); !slices.Equal(got, []string{"personal"}) {
@@ -485,9 +502,9 @@ func TestActKeepsOneSession(t *testing.T) {
 // A Jira update's headless run ends with the task still holding its session, so Act goes on in it, not in a new one.
 func TestUpdateKeepsSession(t *testing.T) {
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "true", workdir: dir}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "true"}
 	b.st.Tasks = map[string]*Task{"a": {ID: "a", Job: &Job{Action: "update", Status: "running", SessionID: "id-a"}}}
-	b.run("a", "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}})
+	b.run("a", dir, "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}})
 	if j := b.st.Tasks["a"].Job; j.Status == "running" || j.Session != "a-act" || j.Pane != "7" || j.SessionID != "id-a" || !slices.Equal(j.Rules, []string{"act"}) {
 		t.Errorf("job after the update = %+v, want it ended, still on session a-act in pane 7 with id-a", j)
 	}
@@ -1054,20 +1071,19 @@ esac`
 
 func TestSaveSettings(t *testing.T) {
 	dir := t.TempDir()
-	for _, k := range settingKeys { // not the live service's env
+	for k := range (&Config{}).settings() { // not the live service's env
 		t.Setenv(k, "")
 	}
-	areas := `[{"id": "work", "dir": "` + dir + `"}]`
-	t.Setenv("HIRDMAN_AREAS", areas)
-	b := &Board{path: filepath.Join(dir, "state.json"), triage: make(chan struct{}, 1), restart: make(chan struct{}, 1),
-		env: map[string]string{"HIRDMAN_AREAS": areas, "HIRDMAN_PR_URL": "https://env/pull/"}}
+	conf := filepath.Join(dir, "hirdman", "config.toml")
+	b := &Board{path: filepath.Join(dir, "state.json"), confPath: conf, triage: make(chan struct{}, 1), restart: make(chan struct{}, 1),
+		conf: Config{PRURL: "https://file/pull/", Areas: []Area{{ID: "work", Dir: dir, Runs: []Run{{Name: "brief", Prompt: "Use the brief skill.\nSend nothing."}}}}}}
 	save := func(body string) int {
 		rec := httptest.NewRecorder()
 		b.handleSaveSettings(rec, httptest.NewRequestWithContext(t.Context(), "PUT", "/api/settings", strings.NewReader(body)))
 		return rec.Code
 	}
-	for _, body := range []string{`{"HIRDMAN_JIRA_POLL": "soon"}`, `{"HIRDMAN_ADDR": ":1"}`, `{"HIRDMAN_AREAS": "[]"}`,
-		`{"HIRDMAN_AREAS": "[{\"id\": \"work\", \"dir\": \"/nonexistent\"}]"}`, `{"HIRDMAN_ISSUE_KEY": "("}`, `{"HIRDMAN_SESSION_IN": "pane"}`} {
+	for _, body := range []string{`{"HIRDMAN_JIRA_POLL": "soon"}`, `{"HIRDMAN_ADDR": ":1"}`, `{"HIRDMAN_AREAS": "{}"}`,
+		`{"HIRDMAN_AREAS": "[{\"id\": \"Work\", \"dir\": \"/\"}]"}`, `{"HIRDMAN_ISSUE_KEY": "("}`, `{"HIRDMAN_SESSION_IN": "pane"}`} {
 		if code := save(body); code != 400 {
 			t.Errorf("%s: %d, want 400", body, code)
 		}
@@ -1076,21 +1092,73 @@ func TestSaveSettings(t *testing.T) {
 	if code := save(`{"HIRDMAN_GITHUB_POLL": "5m"}`); code != 409 {
 		t.Errorf("while a brief runs: %d, want 409", code)
 	}
-	if _, err := os.Stat(settingsPath(b.path)); !os.IsNotExist(err) || len(b.restart) != 0 {
-		t.Fatalf("a refused save wrote settings.json (%v) or restarted (%d)", err, len(b.restart))
+	if _, err := os.Stat(conf); !os.IsNotExist(err) || len(b.restart) != 0 {
+		t.Fatalf("a refused save wrote config.toml (%v) or restarted (%d)", err, len(b.restart))
 	}
 	b.st.Briefs = nil
-	// Only what differs from the env is kept; the PR link set back to the env's drops its override.
-	if code := save(`{"HIRDMAN_GITHUB_POLL": " 5m ", "HIRDMAN_PR_URL": "https://env/pull/"}`); code != 202 || len(b.restart) != 1 {
+	// The areas and settings sent go over the file's; an emptied one leaves it.
+	if code := save(`{"HIRDMAN_GITHUB_POLL": " 5m ", "HIRDMAN_PR_URL": "", "HIRDMAN_AREAS": "[{\"id\": \"kith\", \"dir\": \"~/dev/kith\", \"roadmap\": []}]"}`); code != 202 || len(b.restart) != 1 {
 		t.Fatalf("save: %d, restart %d; want 202 and a restart", code, len(b.restart))
 	}
-	data, err := os.ReadFile(settingsPath(b.path))
-	var got map[string]string
-	if err != nil || json.Unmarshal(data, &got) != nil || !maps.Equal(got, map[string]string{"HIRDMAN_GITHUB_POLL": "5m"}) {
-		t.Fatalf("settings.json %s (%v); want only the GitHub poll", data, err)
+	got, err := loadConfig(conf)
+	if want := (Config{GitHubPoll: "5m", Areas: []Area{{ID: "kith", Dir: "~/dev/kith", Roadmap: []string{}}}}); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("config.toml read back %+v (%v), want %+v", got, err, want)
 	}
-	if before := applySettings(settingsPath(b.path)); before["HIRDMAN_GITHUB_POLL"] != "" || os.Getenv("HIRDMAN_GITHUB_POLL") != "5m" {
-		t.Errorf("HIRDMAN_GITHUB_POLL %q, before %q; want 5m over the env's empty", os.Getenv("HIRDMAN_GITHUB_POLL"), before["HIRDMAN_GITHUB_POLL"])
+	// Multi-line prompts and runs = [] (no brief) survive the round trip.
+	b.conf.Areas[0].Runs = append(b.conf.Areas[0].Runs, Run{Builtin: "roadmap"})
+	b.conf.Areas = append(b.conf.Areas, Area{ID: "nixos", Dir: dir, Runs: []Run{}})
+	if code := save(`{}`); code != 202 {
+		t.Fatalf("save: %d", code)
+	}
+	if got, err := loadConfig(conf); err != nil || !reflect.DeepEqual(got, b.conf) {
+		t.Errorf("config.toml read back %+v (%v), want %+v", got, err, b.conf)
+	}
+
+	// The env wins over the file; no file is an empty config; an unknown key is refused.
+	t.Setenv("HIRDMAN_PR_URL", "https://env/pull/")
+	if before := applyConfig(&b.conf); before["HIRDMAN_GITHUB_POLL"] != "" || os.Getenv("HIRDMAN_PR_URL") != "https://env/pull/" {
+		t.Errorf("before %v, HIRDMAN_PR_URL %q; want the env's", before["HIRDMAN_GITHUB_POLL"], os.Getenv("HIRDMAN_PR_URL"))
+	}
+	b.conf.GitHubPoll = "5m"
+	applyConfig(&b.conf)
+	if os.Getenv("HIRDMAN_GITHUB_POLL") != "5m" {
+		t.Errorf("HIRDMAN_GITHUB_POLL %q, want the file's 5m", os.Getenv("HIRDMAN_GITHUB_POLL"))
+	}
+	if c, err := loadConfig(filepath.Join(dir, "none.toml")); err != nil || !reflect.DeepEqual(c, Config{}) {
+		t.Errorf("no file: %+v, %v; want an empty config", c, err)
+	}
+	if err := os.WriteFile(conf, []byte("githubpol = \"5m\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(conf); err == nil {
+		t.Error("an unknown key was taken")
+	}
+}
+
+// Each due area's prompts run in its folder, in order; the roadmap areas share one run from home.
+func TestRunBriefs(t *testing.T) {
+	dir, work, kith := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(kith, "roadmap.md"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent := filepath.Join(dir, "agent")
+	fake := "#!/bin/sh\nprintf '%s %.20s\\n' \"$PWD\" \"$2\" >> " + dir + "/calls\necho '{\"type\":\"result\",\"result\":\"done\"}'\n"
+	if err := os.WriteFile(agent, []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: agent, home: dir, areas: []Area{
+		{ID: "work", Dir: work, Runs: []Run{{Name: "brief", Prompt: "Use the brief skill."}, {Builtin: "roadmap"}}},
+		{ID: "kith", Dir: kith, Roadmap: defaultRoadmap, Runs: defaultRuns},
+		{ID: "personal", Dir: dir, Runs: []Run{{Name: "sweep", Prompt: "Use the sweep skill."}}}}}
+	now := time.Now()
+	b.st.Briefs = map[string]*Job{"work": {StartedAt: now}, "kith": {StartedAt: now}, "personal": {StartedAt: now}}
+	b.runBriefs([]string{"work", "kith"})
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	if want := work + " Use the brief skill.\n" + dir + " Keep Eugene's Hirdma\n"; string(calls) != want {
+		t.Errorf("runs:\n%s\nwant:\n%s", calls, want)
+	}
+	if b.st.Briefs["work"].Status != "ok" || b.st.Briefs["kith"].Status != "ok" || b.st.Briefs["personal"].EndedAt != nil {
+		t.Errorf("briefs %+v %+v %+v; want work and kith ended ok, personal untouched", *b.st.Briefs["work"], *b.st.Briefs["kith"], *b.st.Briefs["personal"])
 	}
 }
 

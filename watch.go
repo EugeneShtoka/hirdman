@@ -242,10 +242,10 @@ The update: %[3]s
 
 Look %[1]s up in this folder's Jira. If it concerns Eugene (assigned to him, mentions or asks him, a ticket he reported,
 commented on or is blocked by), add it to the board with area %[4]q, in the brief skill's format (step 5 of
-.claude/skills/brief/SKILL.md in the work area's folder, %[5]s):
+.claude/skills/brief/SKILL.md in this folder):
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
-Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID, b.workdir)
+Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID)
 	status, text := runAgent(b.agent, area.Dir, prompt)
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -281,8 +281,9 @@ func (b *Board) scheduleBrief() {
 	}
 }
 
-// runBriefs runs the briefs of the due areas, one agent run after another, and ends each area's brief run with its
-// status: failed if any of its agent runs failed.
+// runBriefs runs the briefs of the due areas, one agent run after another: each area's prompt runs in its folder, then
+// one roadmap run for all of them that have it. It ends each area's brief run with its status: failed if any of its agent
+// runs failed.
 func (b *Board) runBriefs(due []string) {
 	status := map[string]string{}
 	run := func(kind, dir, prompt string, ids ...string) {
@@ -297,17 +298,21 @@ func (b *Board) runBriefs(due []string) {
 			}
 		}
 	}
-	if slices.Contains(due, "work") {
-		run("brief", b.workdir, `Use the brief skill. This is a scheduled run from the Hirdman board and nobody is watching:
-do the sweep, save the history file and sync the board (step 5), but take no actions and send nothing.
-Your final message is the brief's opening paragraph.`, "work")
+	var roadmap []string
+	for i := range b.areas {
+		a := &b.areas[i]
+		if !slices.Contains(due, a.ID) {
+			continue
+		}
+		for _, r := range a.Runs {
+			if r.Builtin == "roadmap" {
+				roadmap = append(roadmap, a.ID)
+			} else {
+				run(cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, a.ID)
+			}
+		}
 	}
-	if slices.Contains(due, "personal") {
-		// A global skill, so it runs from home, not the work repo.
-		run("sweep", b.home, `Use the sweep skill. This is a scheduled run from the Hirdman board and nobody is watching:
-sync the board, but take no actions and send nothing. Your final message is one line: what changed on the board.`, "personal")
-	}
-	if prompt, ids := b.roadmapPrompt(due); prompt != "" {
+	if prompt, ids := b.roadmapPrompt(roadmap); prompt != "" {
 		run("roadmap", b.home, prompt, ids...)
 	}
 
@@ -338,9 +343,10 @@ func (b *Board) dueBriefs() []string {
 	return due
 }
 
-// briefs says whether a has a brief: the brief skill (work), the sweep (personal) or roadmap files.
+// briefs says whether a has a brief: a prompt run, or the roadmap run and roadmap files for it.
 func (b *Board) briefs(a *Area) bool {
-	return a.ID == "work" || a.ID == "personal" || len(a.roadmapFiles()) > 0
+	return slices.ContainsFunc(a.Runs, func(r Run) bool { return r.Builtin != "roadmap" }) ||
+		slices.ContainsFunc(a.Runs, func(r Run) bool { return r.Builtin == "roadmap" }) && len(a.roadmapFiles()) > 0
 }
 
 // briefing says whether the area's brief is running. The caller holds b.mu.
