@@ -1,0 +1,56 @@
+# Build output
+/hirdman
+
+# Local MCP server config (per-developer, not committed)
+/.mcp.json
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.html
+/coverage/
+
+# Docs (internal planning docs)
+/docs/
+PLAN.md
+
+# Claude Code local agent files
+.claude/
+
+# Logs
+*.log
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets — HIRDMAN_* settings live in ~/.config/private/hirdman.env
+# (outside the repo); guard against a local copy being dropped in the tree.
+*.local.yaml
+*.local.toml
+
+# Local runtime state that must never be committed (secrets / personal data)
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db-wal
+*.db-shm
+cookies.txt
+*.cookies
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
+
+# Pinned tools installed by scripts/ensure-tools.sh (tools/versions.env)
+/.tools/

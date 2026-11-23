@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Commit-msg check — blocks a commit whose message credits Claude or Anthropic (a
+# Co-Authored-By trailer, a "Generated with Claude Code" line, a claude.ai session link):
+# hirdman's history names its human authors only.
+#
+# Enable once per clone:   make hooks   (or: git config core.hooksPath .githooks)
+set -euo pipefail
+
+if grep -qiE 'co-authored-by:.*(claude|anthropic)|generated with .*claude|claude-session:|noreply@anthropic\.com' "$1"; then
+	echo "commit-msg: the message credits Claude or Anthropic; hirdman's commits name human authors only" >&2
+	exit 1
+fi

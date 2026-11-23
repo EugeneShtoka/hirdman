@@ -1,0 +1,867 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hirdman</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script>try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch {}</script>
+<style>
+/* Layout: header (headline, filter, settings + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions; ⚙ opens the settings in it. */
+:root {
+  --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
+  --accent: #2f5bd3; --accent-soft: #e6ecfb;
+  --crit: #c2362f; --crit-soft: #fbe9e7; --warn: #a96a06; --warn-soft: #fbf1df; --ok: #23824f; --ok-soft: #e3f3ea;
+  --display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+/* Themes: light (above), dark and cobalt are picked in Settings (data-theme on <html>); with none picked, dark follows the system. */
+@media (prefers-color-scheme: dark) { :root:not([data-theme]) {
+  --bg: #0f1420; --surface: #171e2d; --ink: #e5e9f1; --muted: #98a2b5; --line: #273145;
+  --accent: #7d9cf0; --accent-soft: #1f2a46;
+  --crit: #f0827a; --crit-soft: #3a1f22; --warn: #e2b05a; --warn-soft: #362b17; --ok: #6cc795; --ok-soft: #173126;
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0f1420; --surface: #171e2d; --ink: #e5e9f1; --muted: #98a2b5; --line: #273145;
+  --accent: #7d9cf0; --accent-soft: #1f2a46;
+  --crit: #f0827a; --crit-soft: #3a1f22; --warn: #e2b05a; --warn-soft: #362b17; --ok: #6cc795; --ok-soft: #173126;
+  color-scheme: dark; }
+:root[data-theme="cobalt"] {
+  --bg: #122738; --surface: #193549; --ink: #ffffff; --muted: #9fb6c9; --line: #26506f;
+  --accent: #ffc600; --accent-soft: #1d425e;
+  --crit: #ff628c; --crit-soft: #3d2639; --warn: #ff9d00; --warn-soft: #3a3324; --ok: #3ad900; --ok-soft: #1b3d2e;
+  color-scheme: dark; }
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 0.875rem/1.5 var(--body); }
+/* Full width: extra screen goes to the lanes, not to bigger type. */
+.wrap { padding-block: max(1.5rem, env(safe-area-inset-top, 0rem)) 3rem;
+  padding-left: max(clamp(1rem, 2vw, 2rem), env(safe-area-inset-left, 0rem)); padding-right: max(clamp(1rem, 2vw, 2rem), env(safe-area-inset-right, 0rem));
+  display: grid; gap: 1.25rem; }
+.tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); }
+.tab { all: unset; cursor: pointer; font: 600 0.875rem var(--body); color: var(--muted); padding: 0.5rem 0.875rem; border-bottom: 0.125rem solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.tab:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: -0.125rem; }
+.tab .count { font: 500 0.75rem var(--mono); color: var(--muted); margin-left: 0.25rem; }
+.weeknav { display: flex; gap: 0.75rem; align-items: center; }
+.weeknav b { font: 600 0.875rem var(--mono); font-variant-numeric: tabular-nums; }
+ol.tl li.day { display: block; font: 600 0.75rem var(--mono); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding-top: 0.625rem; border-top: 1px solid var(--line); }
+header { display: grid; gap: 0.875rem; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+@media (max-width: 720px) { header { grid-template-columns: minmax(0, 1fr); } }
+.eyebrow { font: 500 0.75rem var(--mono); color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wrap: balance; }
+.headline { color: var(--muted); margin: 0; font-size: 1.125rem; }
+.note { font: 0.75rem var(--mono); color: var(--warn); }
+
+.side { display: grid; gap: 0.375rem; }
+.progress { background: var(--surface); border: 1px solid var(--line); border-radius: 0.625rem; padding: 0.875rem 1rem; display: grid; gap: 0.625rem; min-width: 17.5rem; }
+@media (max-width: 720px) { .progress { min-width: 0; } }
+.progress .num { font: 700 1.625rem var(--display); font-variant-numeric: tabular-nums; }
+.progress .num small { font: 500 0.8125rem var(--body); color: var(--muted); }
+.bar { height: 0.5rem; background: var(--line); border-radius: 6.1875rem; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--ok); width: 0; transition: width .4s ease; }
+.week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0.375rem; height: 2.875rem; }
+.week div { display: grid; gap: 0.1875rem; justify-items: center; align-content: end; }
+.week i { display: block; width: 100%; background: var(--accent); border-radius: 0.1875rem 0.1875rem 0 0; min-height: 0.125rem; }
+.week i.today { background: var(--ok); }
+.week b { font: 400 0.625rem var(--mono); color: var(--muted); }
+
+.lanes { display: grid; gap: 0.875rem; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; }
+@media (max-width: 1000px) { .lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .lanes { grid-template-columns: minmax(0, 1fr); } }
+.lane { display: grid; gap: 0.5rem; min-width: 0; }
+.lane h2 { font: 600 0.8125rem var(--body); margin: 0; display: flex; gap: 0.5rem; align-items: baseline; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.lane h2 .count { font: 500 0.75rem var(--mono); color: var(--ink); }
+.empty { color: var(--muted); font-size: 0.8125rem; padding: 0.625rem 0.125rem; border-top: 1px dashed var(--line); }
+
+.card { all: unset; box-sizing: border-box; -webkit-user-drag: element; /* all: unset clears it, and Chromium then never starts a drag */ cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.625rem 0.75rem; display: grid; gap: 0.375rem; min-width: 0; }
+.card:hover { border-color: var(--accent); }
+.lanes { align-items: stretch; } .lane { align-content: start; border-radius: 0.5rem; }
+.lane.drop, .card.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
+.card:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
+.card.urgent { border-left: 0.1875rem solid var(--crit); }
+.card.closed .title { color: var(--muted); }
+.card.dropped .title { text-decoration: line-through; }
+.title { font-weight: 500; overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; font: 0.75rem var(--mono); color: var(--muted); }
+.pill { font: 500 0.6875rem var(--mono); padding: 1px 0.4375rem; border-radius: 6.1875rem; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.pill.crit { background: var(--crit-soft); color: var(--crit); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.run { background: var(--warn-soft); color: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+.pill.tag { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+.untag { all: unset; cursor: pointer; margin-left: 0.25rem; }
+.untag:focus-visible, .link:focus-visible { outline: 0.125rem solid var(--accent); }
+.tagrow { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; }
+/* The filter: a dropdown of checkbox groups; what's unchecked is hidden. Each row's "only" shows on hover or focus. */
+.filter { position: relative; display: inline-block; margin-top: 0.625rem; }
+#search { width: 14rem; margin-top: 0.625rem; margin-left: 0.25rem; }
+#settings { margin-top: 0.625rem; margin-left: 0.25rem; }
+.filter summary { list-style: none; }
+.filter summary::-webkit-details-marker { display: none; }
+.filter summary::after { content: " ▾"; color: var(--muted); }
+.filter .menu { position: absolute; z-index: 10; top: calc(100% + 0.25rem); left: 0; min-width: 16rem; max-height: 70vh; overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.75rem; display: grid; gap: 0.875rem; box-shadow: 0 0.5rem 1.5rem rgb(10 14 24 / .2); }
+.filter:not([open]) .menu { display: none; } /* the grid above would otherwise keep the closed menu's links findable by keyboard-hint tools like Vimium */
+.filter fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+.filter legend { display: flex; gap: 0.625rem; align-items: baseline; width: 100%; padding: 0 0 0.25rem; font: 600 0.75rem var(--body); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.filter legend span { flex: 1; }
+.filter .opt { display: flex; gap: 0.5rem; align-items: center; }
+.filter .opt .link { opacity: 0; }
+.filter .opt:hover .link, .filter .opt .link:focus-visible { opacity: 1; }
+.filter label { flex: 1; display: flex; gap: 0.5rem; align-items: center; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
+.link { all: unset; cursor: pointer; color: var(--accent); font: 500 0.75rem var(--body); }
+@keyframes pulse { 50% { opacity: .55; } }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code.ref { font: 500 0.75rem var(--mono); }
+code { font: 0.9em var(--mono); }
+
+section.log { background: var(--surface); border: 1px solid var(--line); border-radius: 0.625rem; padding: 0.875rem 1rem; display: grid; gap: 0.5rem; }
+section.log h2, dialog h3 { font: 700 1rem var(--display); margin: 0; }
+ol.tl { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+ol.tl li { display: grid; grid-template-columns: 3.25rem minmax(0, 1fr); gap: 0.625rem; }
+ol.tl time { font: 0.75rem var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 1px; }
+ol.tl .who { font: 500 0.6875rem var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+ol.tl .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+dialog { width: min(47.5rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); border: 1px solid var(--line); border-radius: 0.75rem; padding: 0; background: var(--surface); color: var(--ink); }
+dialog::backdrop { background: rgb(10 14 24 / .45); }
+.dlg { display: grid; gap: 1rem; padding: 1.125rem 1.25rem 1.25rem; }
+.dlg-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.75rem; align-items: start; }
+.dlg-head h2 { font: 700 1.25rem/1.25 var(--display); margin: 0 0 0.375rem; text-wrap: balance; overflow-wrap: anywhere; }
+.x { all: unset; cursor: pointer; font: 1.25rem var(--mono); color: var(--muted); padding: 0 0.375rem; border-radius: 0.375rem; }
+.x:focus-visible { outline: 0.125rem solid var(--accent); }
+.story { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 72ch; }
+/* A question the task's agent session waits on, answered here. */
+.ask { border: 1px solid var(--warn); border-radius: 0.625rem; padding: 0.75rem 0.875rem; display: grid; gap: 0.75rem; }
+fieldset.proj { border: 1px solid var(--line); border-radius: 0.625rem; margin: 0; padding: 0.75rem 0.875rem; display: grid; gap: 0.625rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+fieldset.proj .btns { grid-column: 1 / -1; }
+fieldset.proj legend { font: 600 0.875rem var(--body); padding: 0 0.25rem; }
+.ask fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.375rem; }
+.ask legend { font: 600 0.875rem var(--body); padding: 0 0 0.25rem; }
+.ask label.opt { display: flex; gap: 0.5rem; align-items: baseline; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
+.refs { display: flex; flex-wrap: wrap; gap: 0.5rem 0.875rem; font-size: 0.8125rem; }
+.actions { border-top: 1px solid var(--line); padding-top: 0.875rem; display: grid; gap: 0.625rem; }
+label { font: 500 0.75rem var(--body); color: var(--muted); display: grid; gap: 0.25rem; }
+textarea, input[type=text], input[type=search] { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; width: 100%; }
+textarea { min-height: 4.5rem; resize: vertical; }
+textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-offset: 0; border-color: transparent; }
+.btns { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.btn { font: 600 0.8125rem var(--body); border-radius: 0.5rem; padding: 0.5rem 0.875rem; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.btn.danger { color: var(--crit); }
+/* Close, Drop and Delete: one split button, the likeliest up front and the other two, with Combine…, in its menu, which opens upward from the dialog's foot, its right edge on the button's since the button sits at the row's right. */
+.split { position: relative; display: inline-flex; margin-left: auto; }
+.split > .btn { border-radius: 0.5rem 0 0 0.5rem; }
+.split summary { list-style: none; border-left: 0; border-radius: 0 0.5rem 0.5rem 0; padding-inline: 0.5rem; }
+.split summary::-webkit-details-marker { display: none; }
+.split .menu { position: absolute; z-index: 10; bottom: calc(100% + 0.25rem); right: 0; display: grid; gap: 0.25rem; padding: 0.25rem; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; box-shadow: 0 0.5rem 1.5rem rgb(10 14 24 / .2); }
+.split details:not([open]) .menu { display: none; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+/* A text field with 📎 inside at its right, as in a chat, to attach files; the picked files' chips line up before it. */
+.composer { background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; display: grid; }
+.composer:focus-within { outline: 0.125rem solid var(--accent); border-color: transparent; }
+.composer textarea { border: 0; background: transparent; }
+.composer textarea:focus { outline: 0; }
+.composer .tools { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; justify-content: flex-end; padding: 0 0.375rem 0.375rem; }
+.ico { all: unset; cursor: pointer; font-size: 1.125rem; line-height: 1; color: var(--muted); padding: 0.25rem 0.375rem; border-radius: 0.375rem; }
+.ico:hover:not(:disabled) { background: var(--surface); }
+.ico:focus-visible { outline: 0.125rem solid var(--accent); }
+.ico:disabled { opacity: .5; cursor: not-allowed; }
+.hint { font-size: 0.75rem; color: var(--muted); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
+select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; }
+.err { font-size: 0.8125rem; color: var(--crit); }
+@media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } .pill.run { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Hirdman</h1>
+      <p class="headline" id="headline">Tasks from the daily brief appear here once the agent writes them.</p>
+      <div class="note" id="note" hidden></div>
+      <details class="filter" id="filter"><summary class="btn" id="filter-sum">Show: all</summary><div class="menu" id="filter-menu"></div></details>
+      <input type="search" id="search" aria-label="Search tasks" placeholder="Search, !exclude">
+      <button class="btn" id="settings" aria-label="Settings" title="Settings">⚙</button>
+    </div>
+    <div class="side">
+      <div class="progress" aria-label="Last brief">
+        <div class="eyebrow">Last brief</div>
+        <div class="num" id="date">None yet</div>
+        <div class="hint" id="brun" hidden></div>
+        <button class="btn" id="run-brief">Run brief now</button>
+      </div>
+      <div class="progress" aria-label="Today's progress">
+        <div class="num" id="pnum">0 / 0 <small>closed today</small></div>
+        <div class="bar"><span id="pbar"></span></div>
+        <div class="week" id="week" aria-label="Tasks closed per day, last 7 days"></div>
+      </div>
+    </div>
+  </header>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" id="tab-tickets" aria-controls="lanes">Tickets <span class="count" id="n-tickets"></span></button>
+    <button class="tab" role="tab" id="tab-history" aria-controls="log">History <span class="count" id="n-history"></span></button>
+  </div>
+  <div class="toolbar" id="toolbar">
+    <button class="btn" id="new-task">+ New task</button>
+  </div>
+  <div class="lanes" id="lanes" role="tabpanel" aria-labelledby="tab-tickets"></div>
+  <section class="log" id="log" role="tabpanel" aria-labelledby="tab-history">
+    <div class="weeknav"><button class="btn" id="wk-prev">‹ Earlier week</button><b id="wk-label"></b><button class="btn" id="wk-next">Later week ›</button></div>
+    <ol class="tl" id="activity"></ol>
+  </section>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title"><div class="dlg" id="dlg-body"></div></dialog>
+
+<script>
+const LANES = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting on others"], ["closed", "Closed today"]];
+const GROUP = { waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"], roadmap: ["Roadmap", ""] };
+// Urgency and importance are Eugene's, three levels each; every task has both, medium unless set.
+const LEVEL = [["high", "High"], ["medium", "Medium"], ["low", "Low"]];
+const STATUS = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting"], ["done", "Done"], ["dropped", "Dropped"]];
+// A task's source is who maintains it; "" is the brief.
+const SOURCE = { "": "Brief", eugene: "Eugene", sweep: "Sweep" };
+const $ = (id) => document.getElementById(id);
+const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
+const hm = (s) => new Date(s).toTimeString().slice(0, 5);
+// Dates read day.month (30.11). Accepts a Date, an ISO timestamp or YYYY-MM-DD.
+const dm = (s) => { const d = typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(s + "T12:00") : new Date(s); return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`; };
+const PRE_QA = new Set(["Backlog", "Selected for Development", "ToDo", "To Do", "In Progress", "Dev Done"]);
+// A kith: link opens kith at that room, and at the message when there is one.
+const kithURI = (room, event) => "kith:" + encodeURIComponent(room) + (event ? "?event=" + encodeURIComponent(event) : "");
+const kithLink = (label, room, event) => `<a href="${esc(kithURI(room, event))}">${esc(label)} ↗</a>`;
+// A message opens at its url (kith-mcp's link: the network's own, like matrix.to) when it is https, else in kith.
+const messageLink = (m) => /^https:\/\//.test(m.url || "") ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.label || "message")} ↗</a>` : kithLink(m.label || "message", m.room, m.event);
+const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// Issue and PR link bases come from the server: the area's issueUrl and prUrl (its folder's GitHub origin when unset), else HIRDMAN_ISSUE_URL and HIRDMAN_PR_URL; no link when unset.
+const cfg = () => state.config || {};
+const bases = (area) => { const a = (cfg().areas || []).find((x) => x.id === area) || {}; return { issue: esc(a.issueUrl ?? cfg().issue ?? ""), pr: esc(a.prUrl ?? cfg().pr ?? "") }; };
+const refs = (s, { issue, pr }) => esc(s)
+  .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => issue ? `<a href="${issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
+  .replace(/(^|[\s(*])#(\d{3,5})\b/g, (m, pre, n) => pr ? `${pre}<a href="${pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
+  .replace(/(^|\s)(https?:\/\/[^\s<]*[^\s<.,:!?)])/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+// The markdown the brief writes: `code` and [text](url) are cut out before refs links keys and URLs, **bold** last.
+// Keys and #numbers link with the bases of the area the text belongs to.
+const linkify = (s, area) => String(s ?? "").split(/(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/)
+  .map((p, i) => i % 2 === 0 ? refs(p, bases(area)) : p[0] === "`" ? `<code>${esc(p.slice(1, -1))}</code>`
+    : p.replace(/^\[(.+)\]\((.+)\)$/, (m, t, u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t)}</a>`))
+  .join("").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+let state = { brief: {}, tasks: [] }, pend = [], openId = null, today = ymd(new Date()), poll;
+// Set a node's markup only when it changed, so a data update leaves untouched nodes (focus, selection, a drag in progress) alone.
+const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
+
+const closed = (t) => t.status === "done" || t.status === "dropped";
+const running = (t) => t.job && t.job.status === "running";
+const closedToday = (t) => t.doneAt && ymd(new Date(t.doneAt)) === today;
+// Closed shows today's closed tasks, and while searching every closed task that matches, so an old one can be found.
+function laneOf(t) {
+  if (closed(t)) return closedToday(t) || terms().length ? "closed" : null;
+  return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
+}
+// Areas come from the server (HIRDMAN_AREAS); work holds anything unmarked.
+const areaList = () => (cfg().areas || []).map((a) => [a.id, a.name]);
+const areaName = (id) => (areaList().find(([v]) => v === id) || [id, id])[1];
+const allTags = (ts = state.tasks) => [...new Set(ts.flatMap((t) => t.tags || []))].sort();
+// The people a task is with: the board stores who as full names, comma-separated.
+const people = (t) => (t.who || "").split(",").map((n) => n.trim()).filter(Boolean);
+const allPeople = (ts) => [...new Set(ts.flatMap(people))].sort();
+// Every value of a task field in use, sorted; "" is a task without one.
+const allOf = (ts, f) => [...new Set(ts.map((t) => t[f] || ""))].sort();
+// The filter narrows the lanes, the progress summary and History by each task field below and tag. It keeps
+// what's unchecked, so a new project, source, person or tag shows up by default; "" is a task with no group, source,
+// person or tag. "Waiting for" lists each person in who; the task's waitingFor sentence is free text and stays on the card.
+let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], source: [], tag: [] };
+// A saved dim the filter no longer has (waitingFor) is dropped, or it would still hide tasks.
+try { for (const [dim, off] of Object.entries(JSON.parse(localStorage.getItem("hide")))) if (dim in hide) hide[dim] = off; } catch {}
+// Waiting for, Source and Tags list only what the tasks of the shown projects have; the fixed dims list every value.
+const filterOpts = (ts = state.tasks.filter((t) => !hide.area.includes(t.area))) => [["area", "Project", areaList()], ["status", "Status", STATUS],
+  ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
+  ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
+  ["who", "Waiting for", [...allPeople(ts).map((n) => [n, n]), ["", "No one"]]],
+  ["source", "Source", allOf(ts, "source").map((v) => [v, SOURCE[v] || v])],
+  ["tag", "Tags", [...allTags(ts).map((g) => [g, g]), ["", "No tag"]]]];
+// The search keeps a task whose title, story, people, tags and Jira keys hold every word and none of the !words.
+const terms = () => $("search").value.toLowerCase().split(/\s+/).filter((w) => w && w !== "!");
+const found = (t) => {
+  const s = [t.title, t.summary, t.who, t.waitingFor, ...(t.tags || []), ...(t.jira || [])].join(" ").toLowerCase();
+  return terms().every((w) => w[0] === "!" ? !s.includes(w.slice(1)) : s.includes(w));
+};
+const filtering = () => Object.values(hide).some((v) => v.length) || terms().length > 0;
+// Each filter dim is the task field of that name; a task with several tags or people shows while any of them is checked.
+const valsOf = (t, dim) => dim === "tag" ? t.tags || [] : dim === "who" ? people(t) : [t[dim] || ""];
+const visible = (t) => found(t) && Object.entries(hide).every(([dim, off]) => {
+  const v = valsOf(t, dim);
+  return v.length ? v.some((x) => !off.includes(x)) : !off.includes("");
+});
+const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
+
+function pills(t) {
+  const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
+  if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(areaName(t.area))}</span>`);
+  for (const g of t.tags || []) out.push(`<span class="pill tag">${esc(g)}</span>`);
+  if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
+  if (t.urgency && t.urgency !== "medium") out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
+  if (t.importance && t.importance !== "medium") out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
+  if (t.job && t.job.question) out.push(`<span class="pill warn">Agent asks</span>`);
+  if (running(t)) out.push(`<span class="pill run">Agent: ${esc(t.job.action)}…</span>`);
+  else if (t.job && t.job.pane) out.push(`<span class="pill">session open</span>`);
+  else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
+  if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
+  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + (closedToday(t) ? "" : dm(t.doneAt) + " ") + hm(t.doneAt) : ""}</span>`);
+  else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
+  if (t.who || t.waitingFor) out.push(`<span>${esc([t.who, t.waitingFor].filter(Boolean).join(": "))}</span>`);
+  return out.join("");
+}
+
+function render() {
+  const opts = filterOpts();
+  // A hidden value that no longer exists (a removed project, a tag nobody has) is forgotten; one only another project has is kept.
+  for (const [dim, , vals] of filterOpts(state.tasks)) hide[dim] = hide[dim].filter((v) => vals.some(([x]) => x === v));
+  const by = { todo: [], doing: [], waiting: [], closed: [] };
+  for (const t of state.tasks.filter(visible)) { const l = laneOf(t); if (l) by[l].push(t); }
+  // The checkboxes are set after the markup, so a click doesn't rebuild the menu and lose focus.
+  put($("filter-menu"), opts.map(([dim, label, vals]) => `<fieldset><legend><span>${label}</span><button type="button" class="link" data-dim="${dim}" data-to="all">All</button></legend>${
+    vals.map(([v, l]) => `<div class="opt"><label><input type="checkbox" data-dim="${dim}" value="${esc(v)}">${esc(l)}</label><button type="button" class="link" data-dim="${dim}" data-to="only" data-v="${esc(v)}" aria-label="Only ${esc(l)}">only</button></div>`).join("")}</fieldset>`).join(""));
+  for (const c of $("filter-menu").querySelectorAll("input")) c.checked = !hide[c.dataset.dim].includes(c.value);
+  put($("filter-sum"), "Show: " + esc(opts.map(([dim, label, vals]) => {
+    const on = vals.filter(([v]) => !hide[dim].includes(v));
+    return on.length === vals.length ? "" : on.length === 1 ? on[0][1] : `${label} ${on.length} of ${vals.length}`;
+  }).filter(Boolean).join(" · ") || "all"));
+  for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
+    : (a.urgency === "high" ? 0 : 1) - (b.urgency === "high" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
+  const searching = terms().length > 0;
+  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${k === "closed" && searching ? "Closed" : label} <span class="count">${by[k].length}</span></h2>${
+    // A div, not a <button>: Firefox won't drag buttons.
+    by[k].map((t) => `<div class="card ${t.urgency === "high" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
+    || `<div class="empty">${k === "closed" ? searching ? "No closed task matches." : "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
+
+  const done = by.closed.filter(closedToday).length, total = by.todo.length + by.doing.length + by.waiting.length + done;
+  put($("pnum"), `${done} / ${total} <small>closed today</small>`);
+  $("pbar").style.width = total ? `${(100 * done) / total}%` : "0";
+  const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
+  const counts = days.map((d) => state.tasks.filter(visible).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
+  put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
+
+  $("n-tickets").textContent = total - done;
+  $("n-history").textContent = [...state.tasks.filter(visible).flatMap((t) => t.history || []), ...(filtering() ? [] : state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
+
+  const b = state.brief || {};
+  if (b.headline) put($("headline"), linkify(b.headline, "work"));
+  // The headline is the work brief's, so it shows only while work does.
+  $("headline").hidden = hide.area.includes("work");
+  // Each shown area's last brief (work's is also the brief the agent last pushed), newest on top; the button briefs the shown areas.
+  const shown = areaList().filter(([v]) => !hide.area.includes(v));
+  const runs = shown.map(([v, l]) => {
+    const run = (state.briefs || {})[v], at = v === "work" && b.at && (!run || new Date(b.at) > new Date(run.startedAt)) ? b.at : run?.startedAt;
+    return at && { l, at, status: at === run?.startedAt ? run.status : "ok" };
+  }).filter(Boolean).sort((x, y) => new Date(y.at) - new Date(x.at));
+  // The headline time is the oldest of them: how stale the least fresh shown area is.
+  const oldest = runs[runs.length - 1];
+  $("date").textContent = oldest ? `${dm(oldest.at)} ${hm(oldest.at)}` : "None yet";
+  $("brun").hidden = !runs.length;
+  put($("brun"), runs.map((x) => `${esc(x.l)} ${dm(x.at)} ${hm(x.at)}${x.status === "running" ? " running…" : x.status === "failed" ? " failed" : ""}`).join("<br>"));
+  $("run-brief").textContent = hide.area.length ? `Brief ${shown.length === 1 ? shown[0][1] : shown.length + " projects"} now` : "Run brief now";
+  $("run-brief").disabled = !shown.length;
+  if (openId) renderDialog(false);
+}
+
+// The dialog's inputs are built once when it opens; data updates patch only the live parts around them, so typing is never interrupted.
+function renderDialog(fresh) {
+  const t = state.tasks.find((x) => x.id === openId);
+  if (!t) return;
+  if (fresh) { pend = []; $("dlg-body").innerHTML = `
+    <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
+      <button class="x" id="x" aria-label="Close">×</button></div>
+    <div id="d-story" style="display:contents"></div>
+    <form class="ask" id="d-ask" hidden></form>
+    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Project<select id="f-area">${areaOpts(t.area)}</select></label>
+      <label for="f-urgency">Urgency<select id="f-urgency">${levelOpts(t.urgency)}</select></label>
+      <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
+    <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
+      <input type="text" id="f-tag" list="tag-list" maxlength="40" placeholder="Add a tag, Enter" style="width:12rem"></div><datalist id="tag-list"></datalist></div>
+    <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Triggers: once this happens, an agent session does this</label>
+      <div class="tagrow"><span id="d-trigs" style="display:contents"></span></div>
+      ${trigField('<button type="button" class="btn" id="f-trig-add">Add trigger</button>')}</div>
+    <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
+    <div class="actions">
+      <div id="d-busy" style="display:contents"></div>
+      <div style="display:grid;gap:0.25rem"><label for="f-comment">Guidance for the agent (optional: what to do, or what to find out)</label>
+        ${composer(`<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea>`, "Files for the agent, attached when you press a button")}</div>
+      <label id="f-resume-row" style="display:flex;gap:0.5rem;align-items:center" hidden><input type="checkbox" id="f-resume" checked>Resume the task's agent session (unchecked: start a new one)</label>
+      <div class="btns" id="d-btns"></div>
+      <div class="tagrow" id="d-comb" hidden><label for="f-comb">Combine with<select id="f-comb"></select></label><button type="button" class="btn" id="f-comb-go">Combine</button></div>
+      <div class="hint">Reply sends right away. Send opens an agent session on this task (wezterm, or claude.ai/code), and the task keeps it: Send again goes on in it, resumed if it closed, and while the agent works it adds the guidance to it. Its questions show here to answer, its report lands in the history; Close, Drop and Delete stop it. Combine (or dropping a card on another) keeps the older task and moves the newer one's history, story and files into it.</div>
+      <div class="err" id="f-err" hidden></div>
+    </div>`; }
+  // Send while the agent works types the guidance into its session, which only a wezterm pane can take.
+  const busy = running(t), adds = busy && !!t.job.pane;
+  const js = t.jiraStatus || {}, late = preQa(t);
+  const refs = [...(t.jira || []).map((k) => `<span><a href="${bases(t.area).issue}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
+    ...(t.messages || []).map(messageLink),
+    ...(t.thread && t.thread.room ? [kithLink(t.thread.reply_to ? "reply goes here" : "reply room", t.thread.room, t.thread.reply_to)] : []),
+    ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
+  put($("dlg-title"), esc(t.title));
+  put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
+  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary, t.area)}</div>` : `<div class="hint">No story recorded yet. The agent can fill it in.</div>`}
+    ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
+  const q = t.job && t.job.question;
+  $("d-ask").hidden = !q;
+  $("f-resume-row").hidden = busy || !(t.job && t.job.sessionId);
+  put($("d-ask"), q ? askForm(q) : "");
+  if (document.activeElement !== $("f-area")) $("f-area").value = t.area;
+  if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
+  if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
+  put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
+  put($("d-trigs"), (t.triggers || []).map((x, i) => `<span class="pill tag">${esc(trigWhen(x))}: ${esc(x.do)}${x.fired ? ` · fired ${dm(x.fired)}` : ""}<button type="button" class="untag" data-untrig="${i}" aria-label="Remove trigger ${esc(trigWhen(x))}">×</button></span>`).join(""));
+  // Suggest every tag in use that this task doesn't have yet.
+  put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
+  put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
+    `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text, t.area)}</span></span></li>`).join("")
+    || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`);
+  put($("d-busy"), busy ? `<div class="pill run" style="justify-self:start">The agent is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : "");
+  put($("d-btns"), `
+    <button class="btn ${t.who ? "" : "primary"}" data-act="act" title="A new session on the task, or the one it already has" ${busy && !adds ? "disabled" : ""}>Send</button>
+    ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
+    ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
+    ${endButton(t)}`);
+}
+// Close for a task still open, Delete for one already closed; the other two and Combine… are a click away in the menu.
+function endButton(t) {
+  const ends = { close: ["Close", t.status === "done"], drop: ["Drop", t.status === "dropped"], delete: ["Delete", false] };
+  const first = closed(t) ? "delete" : "close";
+  const btn = (k) => `<button class="btn ${k === "close" ? "" : "danger"}" data-act="${k}" ${ends[k][1] ? "disabled" : ""}>${ends[k][0]}</button>`;
+  return `<span class="split">${btn(first)}<details><summary class="btn" aria-label="More ways to end the task">▾</summary><div class="menu">${
+    Object.keys(ends).filter((k) => k !== first).map(btn).join("")}<button class="btn" data-act="combine">Combine…</button></div></details></span>`;
+}
+
+// A question the task's session waits on (handleAsk): each one's options, and Eugene's own words in place of them.
+const askForm = (q) => `<h3>The agent asks</h3>${q.questions.map((x, i) => `<fieldset><legend>${esc(x.question)}</legend>${
+  x.options.map((o) => `<label class="opt"><input type="${x.multiSelect ? "checkbox" : "radio"}" name="q${i}" value="${esc(o.label)}"><span>${esc(o.label)}${o.description ? ` <span class="hint">${esc(o.description)}</span>` : ""}</span></label>`).join("")}
+  <input type="text" name="q${i}-own" placeholder="Or say it in your words" aria-label="Your own answer to: ${esc(x.question)}"></fieldset>`).join("")}
+  <div class="btns"><button class="btn primary" type="submit">Answer</button><button class="btn" type="button" id="ask-term">Answer in the terminal</button></div>`;
+// Several picks join with ", " and own words, as the agent's own prompt sends them; own words replace a single pick.
+function answer(e) {
+  e.preventDefault();
+  const f = $("d-ask"), answers = {};
+  for (const [i, x] of state.tasks.find((t) => t.id === openId).job.question.questions.entries()) {
+    const picked = [...f.querySelectorAll(`[name="q${i}"]:checked`)].map((c) => c.value), own = f.elements[`q${i}-own`].value.trim();
+    const a = x.multiSelect ? [...picked, own].filter(Boolean).join(", ") : own || picked[0];
+    if (!a) { $("f-err").hidden = false; $("f-err").textContent = "Answer every question."; return; }
+    answers[x.question] = a;
+  }
+  sendAnswer(answers);
+}
+// No answers hand the question back to the session's terminal.
+async function sendAnswer(answers) {
+  $("f-err").hidden = true;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/answer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answers }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't send the answer."; return; }
+  apply(r);
+}
+
+const areaOpts = (sel) => areaList()
+  .map(([v, l]) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(l)}</option>`).join("");
+const levelOpts = (sel) => LEVEL
+  .map(([v, l]) => `<option value="${v}" ${v === (sel || "medium") ? "selected" : ""}>${l}</option>`).join("");
+
+// New task: an id from the title, the area preset from the filter when it shows one area, Eugene as its creator.
+function renderNew() {
+  const on = areaList().filter(([v]) => !hide.area.includes(v)), pre = on.length === 1 ? on[0][0] : "work";
+  pend = [];
+  $("dlg-body").innerHTML = `
+    <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
+    <form id="new-form" style="display:grid;gap:0.875rem">
+      <label for="n-title">Title<input type="text" id="n-title" required maxlength="200"></label>
+      <div class="tagrow" style="gap:0.875rem"><label for="n-area">Project<select id="n-area">${areaOpts(pre)}</select></label>
+        <label for="n-urgency">Urgency<select id="n-urgency">${levelOpts("")}</select></label>
+        <label for="n-importance">Importance<select id="n-importance">${levelOpts("")}</select></label></div>
+      <label for="n-tags">Tags (comma-separated)<input type="text" id="n-tags" maxlength="200" placeholder="e.g. infra, q4"></label>
+      <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Trigger (optional): once this happens, an agent session does this</label>${trigField("")}</div>
+      <div style="display:grid;gap:0.25rem"><label for="n-summary">The story (what, for whom, by when; the agent reads this when you press Send)</label>
+        ${composer(`<textarea id="n-summary"></textarea>`, "Files the agent reads too")}</div>
+      <div class="btns"><button class="btn primary" type="submit">Add</button></div>
+      <div class="err" id="f-err" hidden></div>
+    </form>`;
+}
+async function addTask(e) {
+  e.preventDefault();
+  const title = $("n-title").value.trim(); if (!title) return;
+  const id = "m-" + (title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "task") + "-" + Date.now().toString(36);
+  const body = { title, area: $("n-area").value, summary: $("n-summary").value.trim(), status: "todo", since: today, source: "eugene",
+    urgency: $("n-urgency").value, importance: $("n-importance").value, tags: [...new Set($("n-tags").value.split(",").map(tagOf).filter(Boolean))] };
+  const tr = newTrig();
+  if (typeof tr === "string") { $("f-err").hidden = false; $("f-err").textContent = tr; return; }
+  if (tr) body.triggers = [tr];
+  const r = await fetch(`api/tasks/${id}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't add the task."; return; }
+  const failed = await attach(id);
+  await apply(r);
+  openId = id; renderDialog(true);
+  if (failed) { $("f-err").hidden = false; $("f-err").textContent = "Added the task. " + failed; }
+}
+
+// Files wait in pend, shown as removable chips, until attach uploads them to the task; it returns why that failed, or "".
+const composer = (field, what) => `<div class="composer">${field}<div class="tools"><span id="f-list" style="display:contents"></span>
+  <button type="button" class="ico" id="f-pick" title="${what}" aria-label="Attach files">📎</button><input type="file" id="f-files" multiple hidden></div></div>`;
+const showFiles = () => put($("f-list"), pend.map((f, i) => `<span class="pill tag">${esc(f.name)}<button type="button" class="untag" data-unfile="${i}" aria-label="Remove ${esc(f.name)}">×</button></span>`).join(""));
+async function attach(id) {
+  if (!pend.length) return "";
+  const fd = new FormData();
+  for (const f of pend) fd.append("file", f);
+  const r = await fetch(`api/tasks/${encodeURIComponent(id)}/files`, { method: "POST", body: fd }).catch(() => null);
+  return r && r.ok ? "" : (r && (await r.json().catch(() => ({}))).error) || "Couldn't attach the files.";
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("api/state");
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json(); today = ymd(new Date());
+    $("note").hidden = true; render();
+    if (!$("log").hidden) loadLog();
+  } catch (e) { $("note").hidden = false; $("note").textContent = "Can't reach the board server; what's shown may be out of date."; }
+  clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 60000); // a minute: what the server closes on its own (a merged pull request) shows while you look
+}
+
+// Apply the task a write returned to the local data; the poll picks up everything else.
+async function apply(r) {
+  const t = await r.json(), i = state.tasks.findIndex((x) => x.id === t.id);
+  if (i < 0) state.tasks.push(t); else state.tasks[i] = t;
+  render(); return t;
+}
+
+async function act(action, key) {
+  const comment = $("f-comment").value.trim(), err = $("f-err");
+  err.hidden = true;
+  const failed = await attach(openId);
+  if (failed) { err.hidden = false; err.textContent = failed; return; }
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, key, fresh: !$("f-resume").checked }) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { err.hidden = false; err.textContent = body.error || `Failed (${r.status})`; return; }
+  state.tasks = state.tasks.map((t) => (t.id === body.id ? body : t));
+  $("f-comment").value = "";
+  render(); renderDialog(true);
+  clearTimeout(poll); poll = setTimeout(refresh, 3000);
+}
+
+$("lanes").addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches(".card")) { e.preventDefault(); e.target.click(); }
+});
+$("lanes").addEventListener("click", (e) => {
+  const c = e.target.closest(".card"); if (!c) return;
+  openId = c.dataset.id; renderDialog(true); $("dlg").showModal();
+});
+// Drag a card to another lane to change its status, or onto another card to combine the two (desktop only; HTML5 drag events don't fire on touch).
+const LANE_STATUS = { todo: "todo", doing: "doing", waiting: "waiting", closed: "done" };
+let dragId = null; // dataTransfer can't be read during dragover
+const unmark = () => document.querySelectorAll("#lanes .drop").forEach((x) => x.classList.remove("drop"));
+$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) { dragId = c.dataset.id; e.dataTransfer.setData("text/plain", c.dataset.id); } });
+$("lanes").addEventListener("dragend", () => { dragId = null; unmark(); });
+$("lanes").addEventListener("dragover", (e) => {
+  const l = e.target.closest(".lane"); if (!l) return; e.preventDefault();
+  const c = e.target.closest(".card"), onto = c && c.dataset.id !== dragId ? c : null;
+  if (!(onto || l).classList.contains("drop")) { unmark(); (onto || l).classList.add("drop"); }
+});
+$("lanes").addEventListener("dragleave", (e) => { const l = e.target.closest(".lane"); if (l && !l.contains(e.relatedTarget)) l.classList.remove("drop"); });
+$("lanes").addEventListener("drop", async (e) => {
+  const l = e.target.closest(".lane"); if (!l) return;
+  e.preventDefault(); unmark();
+  const c = e.target.closest(".card"), id = e.dataTransfer.getData("text/plain");
+  if (c && c.dataset.id !== id) return combine(id, c.dataset.id);
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t || laneOf(t) === l.dataset.lane) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(t.id)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: LANE_STATUS[l.dataset.lane] }) }).catch(() => null);
+  if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't move “${t.title}”.`; return; }
+  apply(r);
+});
+$("dlg").addEventListener("click", (e) => {
+  if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
+  const u = e.target.closest("[data-untag]");
+  if (u) return setTags(tagsOf().filter((g) => g !== u.dataset.untag));
+  const ut = e.target.closest("[data-untrig]");
+  if (ut) return setTriggers(trigsOf().filter((_, i) => i !== +ut.dataset.untrig));
+  if (e.target.id === "f-trig-add") return addTrigger();
+  if (e.target.id === "f-pick") return $("f-files").click();
+  if (e.target.id === "ask-term") return sendAnswer({});
+  if (e.target.id === "s-add") return editProjects((ps) => ps.push({}));
+  const rp = e.target.closest("[data-unproj]");
+  if (rp) return removeProject(+rp.dataset.unproj);
+  if (e.target.id === "f-comb-go") return combine(openId, $("f-comb").value);
+  const f = e.target.closest("[data-unfile]");
+  if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
+  const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
+  b.closest("details")?.removeAttribute("open");
+  if (b.dataset.act === "combine") return pickCombine();
+  if (b.dataset.act === "close") return closeTask();
+  if (b.dataset.act === "delete") return deleteTask();
+  act(b.dataset.act, b.dataset.key);
+});
+// Close marks the task done, the same PUT as dragging it to Closed.
+async function closeTask() {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "done" }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't close the task."; return; }
+  apply(r);
+}
+// Combine… lists the other tasks on the board to pick the one to combine with.
+function pickCombine() {
+  const others = state.tasks.filter((x) => x.id !== openId && laneOf(x)).sort((a, b) => a.title.localeCompare(b.title));
+  $("f-comb").innerHTML = others.map((x) => `<option value="${esc(x.id)}">${esc(x.title)}</option>`).join("");
+  $("d-comb").hidden = false; $("f-comb").focus();
+}
+// Combine folds the newer of two tasks into the older one (handleCombine), so it asks first; an open dialog then shows the one that stays.
+async function combine(id, withId) {
+  const a = state.tasks.find((x) => x.id === id), c = state.tasks.find((x) => x.id === withId);
+  if (!a || !c || !confirm(`Combine “${a.title}” and “${c.title}”? The older one stays and takes the newer one's history, story and files; the newer one is removed.`)) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(id)}/combine`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ with: withId }) }).catch(() => null);
+  const err = $("dlg").open ? $("f-err") : $("note");
+  if (!r || !r.ok) { err.hidden = false; err.textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't combine the tasks."; return; }
+  const t = await r.json();
+  state.tasks = [...state.tasks.filter((x) => x.id !== id && x.id !== withId), t];
+  if ($("dlg").open) { openId = t.id; renderDialog(true); }
+  render();
+}
+// Delete removes the task and its files for good, so it asks first.
+async function deleteTask() {
+  const t = state.tasks.find((x) => x.id === openId);
+  if (!t || !confirm(`Delete “${t.title}” and its files for good?`)) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}`, { method: "DELETE" }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't delete the task."; return; }
+  state.tasks = state.tasks.filter((x) => x.id !== t.id);
+  $("dlg").close(); render();
+}
+// Tags are typed or picked from the ones in use; "#Some Tag" is stored as some-tag.
+const tagsOf = () => (state.tasks.find((x) => x.id === openId) || {}).tags || [];
+const tagOf = (s) => s.trim().toLowerCase().replace(/^#+/, "").replace(/\s+/g, "-");
+$("dlg").addEventListener("keydown", (e) => {
+  if (e.target.id !== "f-tag" || e.key !== "Enter") return;
+  e.preventDefault();
+  const g = tagOf(e.target.value);
+  e.target.value = "";
+  if (g && !tagsOf().includes(g)) setTags([...tagsOf(), g]);
+});
+async function setTags(tags) {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the tags."; return; }
+  apply(r);
+}
+// Triggers go to the server whole, fired ones as the server gave them, so they don't fire again.
+const trigsOf = () => (state.tasks.find((x) => x.id === openId) || {}).triggers || [];
+// The trigger inputs, in the dialog and the new-task form: what fires it (a branch, a Jira status or a time) and what to do.
+const TRIG = { on: ["a linked PR reaches branch", "text", "development"], jiraStatus: ["a Jira key reaches status", "text", "QA - Staging"], at: ["the time comes", "datetime-local", ""] };
+const trigField = (add) => `<div class="tagrow"><select id="f-trig-kind" aria-label="Fires when">${Object.entries(TRIG).map(([k, [l]]) => `<option value="${k}">${l}</option>`).join("")}</select>
+  <input type="text" id="f-trig-on" maxlength="100" placeholder="development" aria-label="Branch" style="width:11rem">
+  <input type="text" id="f-trig-do" maxlength="500" placeholder="e.g. tell Bar it's on dev" style="flex:1;min-width:10rem">${add}</div>`;
+const trigWhen = (x) => x.at ? `at ${dm(x.at)} ${hm(x.at)}` : x.jiraStatus ? `on Jira ${x.jiraStatus}` : `on ${x.on}`;
+function trigKind() {
+  const [l, type, ph] = TRIG[$("f-trig-kind").value], v = $("f-trig-on");
+  v.type = type; v.placeholder = ph; v.value = ""; v.setAttribute("aria-label", l);
+}
+// newTrig is the trigger the inputs describe, null when they are empty, or what is missing.
+function newTrig() {
+  const kind = $("f-trig-kind").value, v = $("f-trig-on").value.trim(), what = $("f-trig-do").value.trim();
+  if (!v && !what) return null;
+  if (!v || !what) return "A trigger needs when it fires and what to do.";
+  return { [kind]: kind === "at" ? new Date(v).toISOString() : v, do: what };
+}
+function addTrigger() {
+  const tr = newTrig() || "A trigger needs when it fires and what to do.";
+  if (typeof tr === "string") { $("f-err").hidden = false; $("f-err").textContent = tr; return; }
+  $("f-trig-on").value = $("f-trig-do").value = "";
+  setTriggers([...trigsOf(), tr]);
+}
+async function setTriggers(triggers) {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ triggers }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the triggers."; return; }
+  apply(r);
+}
+$("dlg").addEventListener("close", () => { openId = null; });
+// Moving a task to another area also moves where its next session runs.
+$("dlg").addEventListener("change", async (e) => {
+  if (e.target.id === "f-files") { pend.push(...e.target.files); e.target.value = ""; return showFiles(); }
+  if (e.target.id === "theme") return setTheme(e.target.value);
+  if (e.target.id === "f-trig-kind") return trigKind();
+  const field = { "f-area": "area", "f-urgency": "urgency", "f-importance": "importance" }[e.target.id];
+  if (!field || !openId) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [field]: e.target.value }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = `Couldn't change the ${field}.`; return; }
+  apply(r);
+});
+$("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); if (e.target.id === "d-ask") answer(e); if (e.target.id === "settings-form") saveSettings(e); });
+$("run-brief").addEventListener("click", async () => {
+  $("run-brief").disabled = true;
+  const areas = areaList().map(([v]) => v).filter((v) => !hide.area.includes(v));
+  const r = await fetch("api/brief/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ areas }) }).catch(() => null);
+  if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't start the brief: ${r ? (await r.json().catch(() => ({}))).error || r.status : "no server"}.`; $("run-brief").disabled = false; return; }
+  refresh();
+});
+$("new-task").addEventListener("click", () => { openId = null; renderNew(); $("dlg").showModal(); $("n-title").focus(); });
+function setFilter() {
+  try { localStorage.setItem("hide", JSON.stringify(hide)); } catch {}
+  render();
+  if (!$("log").hidden) loadLog();
+}
+$("search").addEventListener("input", setFilter);
+$("filter-menu").addEventListener("change", (e) => {
+  const { dim } = e.target.dataset, v = e.target.value;
+  hide[dim] = e.target.checked ? hide[dim].filter((x) => x !== v) : [...hide[dim], v];
+  setFilter();
+});
+$("filter-menu").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-to]"); if (!b) return;
+  const { dim } = b.dataset;
+  // "only" hides every other value of its group.
+  hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v).filter((v) => v !== b.dataset.v);
+  setFilter();
+});
+// A dropdown (the filter, a task's Close/Drop/Delete menu) closes on a click outside it; the filter also on Escape.
+document.addEventListener("click", (e) => { for (const d of document.querySelectorAll("details[open]")) if (!d.contains(e.target)) d.open = false; });
+$("filter").addEventListener("keydown", (e) => { if (e.key === "Escape" && $("filter").open) { $("filter").open = false; $("filter-sum").focus(); } });
+// The theme is kept per browser; "" follows the system's light or dark.
+function setTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { if (t) localStorage.setItem("theme", t); else localStorage.removeItem("theme"); } catch {}
+}
+// Settings by category: [key, label, hint, kind]. The board's are its HIRDMAN_* settings, saved over the service's env
+// (saving restarts the board); kind is text (default), projects, check, ro (shown only) or a list of choices; "" is the first.
+// The board-wide values below the projects are the defaults a project without its own takes.
+const SETTINGS = [
+  ["Projects", [["HIRDMAN_AREAS", "Projects", "Work is required: the brief runs in it.", "projects"]]],
+  ["Briefs", [["HIRDMAN_BRIEF_EVERY", "Brief every", "How often a project without its own is briefed, e.g. 6h; empty is only by the button."]]],
+  ["Watchers", [["HIRDMAN_JIRA_POLL", "Jira feed poll", "Empty is 2m."], ["HIRDMAN_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
+    ["HIRDMAN_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."], ["HIRDMAN_KITH_MCP", "kith MCP command", "Empty is kith-mcp."]]],
+  ["Sessions", [["HIRDMAN_AGENT", "Agent command", "Empty is claude."], ["HIRDMAN_TERMINAL", "Terminal", "Empty is the wezterm mux, else a command the session is appended to, e.g. kitty."],
+    ["HIRDMAN_SESSION_IN", "A wezterm session opens in", "", [["", "A new tab"], ["window", "Its own window"]]],
+    ["HIRDMAN_CLEAN_MERGED", "Clean up merged work", "A task done with a merged pull request closes its session and removes its worktree.", "check"]]],
+  ["Links", [["HIRDMAN_ISSUE_URL", "Issue link base", "For projects without their own; an issue key is appended, e.g. https://you.atlassian.net/browse/."],
+    ["HIRDMAN_PR_URL", "Pull request link base", "For projects without their own; a #number is appended."]]],
+  ["Server", [["HIRDMAN_URL", "Board URL", "How the agent reaches the board; empty is http://localhost and the address."],
+    ["HIRDMAN_ADDR", "Address", "Set in the service's env only.", "ro"], ["HIRDMAN_STATE", "State file", "Set in the service's env only; settings.json sits next to it.", "ro"]]],
+];
+// A project's fields, HIRDMAN_AREAS keys: [key, label, hint]. Roadmap is a list, edited comma-separated.
+const PROJECT = [["id", "Id", "Stored on its tasks: lowercase, unique, e.g. kith."], ["name", "Name", "Shown on the board; empty is the id."],
+  ["dir", "Folder", "Where its sessions run, e.g. ~/dev/kith."],
+  ["roadmap", "Roadmap files", "Globs in the folder, comma-separated; empty is roadmap.md, TODO.md and the like; none reads no files."],
+  ["jiraRoom", "Jira feed room", "The kith room its Jira bot posts in; empty watches none."],
+  ["briefEvery", "Brief every", "e.g. 6h; empty is the board's below; 0 is only by the button."],
+  ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is its folder's GitHub origin, else the board's below."]];
+let projects = [], projectsRaw = "", projectsLoaded = "";
+const projectHTML = (p, i) => `<fieldset class="proj" data-proj="${i}"><legend>${esc(p.name || p.id || "New project")}</legend>
+  ${PROJECT.map(([k, label, hint]) => { const v = k === "roadmap" ? (Array.isArray(p[k]) ? p[k].join(", ") || "none" : "") : p[k] || "";
+    return `<label for="p${i}-${k}">${label}<input type="text" id="p${i}-${k}" data-pk="${k}" value="${esc(v)}" spellcheck="false"><span class="hint">${hint}</span></label>`; }).join("")}
+  ${p.id === "work" ? "" : `<div class="btns"><button type="button" class="btn danger" data-unproj="${i}">Remove ${esc(p.name || p.id || "project")}</button></div>`}</fieldset>`;
+// The fields over the projects as loaded, so keys the form doesn't edit are kept; an empty field leaves its key out.
+const readProjects = () => [...document.querySelectorAll("[data-proj]")].map((f) => {
+  const p = { ...projects[+f.dataset.proj] };
+  for (const el of f.querySelectorAll("[data-pk]")) {
+    const k = el.dataset.pk, v = el.value.trim();
+    if (!v) delete p[k];
+    else p[k] = k !== "roadmap" ? v : v === "none" ? [] : v.split(",").map((g) => g.trim()).filter(Boolean);
+  }
+  return p;
+});
+function editProjects(change) {
+  projects = readProjects(); change(projects);
+  $("s-projects").innerHTML = projects.map(projectHTML).join("");
+}
+// A project with open tasks asks first: they keep it as theirs but can't open a session until moved.
+function removeProject(i) {
+  const p = readProjects()[i], open = state.tasks.filter((t) => t.area === p.id && !closed(t)).length;
+  if (open && !confirm(`${p.name || p.id} has ${open} open task${open > 1 ? "s" : ""}. Remove it anyway?`)) return;
+  editProjects((ps) => ps.splice(i, 1));
+}
+async function renderSettings() {
+  openId = null;
+  const r = await fetch("api/settings").catch(() => null);
+  const { settings: now = {}, env = {} } = r && r.ok ? await r.json() : {};
+  const field = ([k, label, hint, kind]) => {
+    const v = now[k] || "", id = "s-" + k, on = kind !== "ro" && v !== (env[k] || "");
+    if (kind === "projects") {
+      projectsRaw = v;
+      try { projects = JSON.parse(v); } catch { projects = []; }
+      projectsLoaded = JSON.stringify(projects);
+      return `<div id="s-projects" style="display:grid;gap:0.875rem">${projects.map(projectHTML).join("")}</div>
+        <div class="btns"><button type="button" class="btn" id="s-add">Add project</button></div>
+        <span class="hint">${esc(hint)}${on ? " Set here; the env file has others." : ""}</span>`;
+    }
+    const input = kind === "check" ? `<input type="checkbox" id="${id}" data-key="${k}" ${v === "1" ? "checked" : ""}>`
+      : Array.isArray(kind) ? `<select id="${id}" data-key="${k}">${kind.map(([o, l]) => `<option value="${o}" ${o === v || !o && v === "tab" ? "selected" : ""}>${l}</option>`).join("")}</select>`
+      : `<input type="text" id="${id}" ${kind === "ro" ? "readonly" : `data-key="${k}"`} value="${esc(v)}">`;
+    return `<label for="${id}">${esc(label)} <code>${k}</code>${input}<span class="hint">${esc(hint)}${on ? ` Set here; the env file has ${env[k] ? `<code>${esc(env[k])}</code>` : "none"}.` : ""}</span></label>`;
+  };
+  $("dlg-body").innerHTML = `
+    <div class="dlg-head"><h2 id="dlg-title">Settings</h2><button class="x" id="x" aria-label="Close">×</button></div>
+    <h3>Appearance</h3>
+    <label for="theme">Theme (this browser)<select id="theme">${[["", "System"], ["light", "Light"], ["dark", "Dark"], ["cobalt", "Cobalt"]]
+      .map(([v, l]) => `<option value="${v}" ${v === (document.documentElement.dataset.theme || "") ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+    ${r && r.ok ? `<form id="settings-form" style="display:grid;gap:0.875rem">
+      ${SETTINGS.map(([cat, fields]) => `<h3>${cat}</h3>${fields.map(field).join("")}`).join("")}
+      <div class="btns"><button class="btn primary" type="submit">Save and restart the board</button></div>
+      <div class="err" id="s-err" hidden></div><div class="hint" id="s-ok" hidden></div>
+    </form>` : `<div class="err">Couldn't read the board's settings.</div>`}`;
+}
+async function saveSettings(e) {
+  e.preventDefault();
+  const body = Object.fromEntries([...$("settings-form").querySelectorAll("[data-key]")].map((el) => [el.dataset.key, el.type === "checkbox" ? (el.checked ? "1" : "") : el.value]));
+  // Unchanged projects go back as loaded, so a save of other settings doesn't pin the env's list in settings.json.
+  const ps = JSON.stringify(readProjects());
+  body.HIRDMAN_AREAS = ps === projectsLoaded ? projectsRaw : ps;
+  const r = await fetch("api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
+  $("s-err").hidden = r && r.ok; $("s-ok").hidden = !(r && r.ok);
+  if (r && r.ok) $("s-ok").textContent = "Saved. The board is restarting; the page picks it up in a few seconds.";
+  else $("s-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't save the settings.";
+}
+$("settings").addEventListener("click", async () => { await renderSettings(); $("dlg").showModal(); });
+// The open tab lives in the URL hash, so a reload or a bookmark keeps it.
+function showTab() {
+  const hist = location.hash === "#history";
+  $("tab-tickets").setAttribute("aria-selected", !hist); $("tab-history").setAttribute("aria-selected", hist);
+  $("lanes").hidden = hist; $("toolbar").hidden = hist; $("log").hidden = !hist;
+  if (hist) loadLog();
+}
+
+// History reads one Monday–Sunday week at a time from the server's week files, newest first, grouped by day.
+const mondayOf = (d) => { const m = new Date(d); m.setDate(m.getDate() - (m.getDay() + 6) % 7); return ymd(m); };
+const addDays = (s, n) => { const d = new Date(s + "T12:00"); d.setDate(d.getDate() + n); return ymd(d); };
+let week = mondayOf(new Date());
+async function loadLog() {
+  const shown = week;
+  const r = await fetch(`api/log?week=${shown}`).catch(() => null);
+  if (!r || !r.ok || shown !== week) return;
+  const { entries: all, older } = await r.json();
+  // A task's line carries its area when written (older lines take the task's current one), and the task's current group and tags;
+  // board-level lines (brief, sweep, triage runs) belong to no one area, so they show only while nothing is filtered out.
+  const tasks = new Map(state.tasks.map((t) => [t.id, t]));
+  for (const e of all) if (e.task && !e.area) e.area = (tasks.get(e.task) || {}).area;
+  const entries = all.filter((e) => e.task ? visible({ ...tasks.get(e.task), area: e.area }) : !filtering());
+  const thisWeek = mondayOf(new Date());
+  $("wk-label").textContent = `${dm(week)} – ${dm(addDays(week, 6))}${week === thisWeek ? " · this week" : ""}`;
+  $("wk-prev").disabled = !older; $("wk-next").disabled = week >= thisWeek;
+  let day = "";
+  $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
+    const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
+    day = d;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(areaName(e.area))}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text, e.area)}</span></span></li>`;
+  }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
+}
+$("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });
+$("wk-next").addEventListener("click", () => { week = addDays(week, 7); loadLog(); });
+$("tab-tickets").addEventListener("click", () => { history.replaceState(null, "", location.pathname + location.search); showTab(); });
+$("tab-history").addEventListener("click", () => { history.replaceState(null, "", "#history"); showTab(); });
+showTab();
+refresh();
+// A background tab's timers are throttled, so coming back to it reads the board at once.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

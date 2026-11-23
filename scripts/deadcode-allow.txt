@@ -1,0 +1,4 @@
+# Functions `go tool deadcode .` may report: reachable only from tests, kept on
+# purpose. One per line, as deadcode prints it after the position ("unreachable func: X"),
+# then the reason. Anything else deadcode finds fails the deadcode gate: move it into a
+# _test.go file, or delete it.

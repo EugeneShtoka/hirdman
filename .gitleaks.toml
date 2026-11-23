@@ -1,0 +1,34 @@
+# gitleaks configuration for hirdman.
+# Used by the local pre-commit hook (.githooks/pre-commit), the `make secrets`
+# target, and the CI secret-scan job.
+title = "hirdman gitleaks config"
+
+# Start from gitleaks' built-in rule set, then narrow with the allowlist below.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project false positives: documented placeholders"
+
+# There is deliberately no `paths` entry for project files. A `paths` entry under
+# [allowlist] is *global*: the old `.*_test\.go$` one switched off the entire
+# inherited rule set for every test file, so a live-shaped token in a test went
+# undetected (kith verified this by planting a `ghp_` PAT). The `regexes` below already cover the placeholders that actually
+# false-positive. If a new test fixture ever does trip a rule, add it to `regexes`,
+# or scope it with a per-rule [[rules.allowlist]] — never re-broaden by path.
+
+# .tools/ holds the pinned third-party tools (scripts/ensure-tools.sh). It is
+# gitignored, never part of the project, and `gitleaks dir` would otherwise scan
+# other people's code on every run.
+paths = [
+  '''(^|/)\.tools/''',
+]
+
+# Placeholder strings that appear in the README / config samples and in test
+# code. These are documentation, not credentials.
+regexes = [
+  '''your-token-here''',
+  '''change-me''',
+  '''s3cr3t''',
+  '''testtoken''',
+]

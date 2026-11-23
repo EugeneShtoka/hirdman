@@ -1,0 +1,53 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please fill in as much as you
+        can — the version field saves a lot of back-and-forth.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        Steps to reproduce:
+        1. ...
+        2. ...
+
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The commit the running service was built from.
+      placeholder: "a1b2c3d"
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      description: Relevant for page rendering and drag-and-drop issues.
+      placeholder: "e.g. Firefox 140, Chromium 141"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Service log
+      description: |
+        Reproduce, then paste the relevant portion of
+        `journalctl --user -u hirdman`. **Redact any tokens or private messages.**
+      render: text
+    validations:
+      required: false
