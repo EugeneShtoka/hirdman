@@ -4,7 +4,7 @@ The daily brief as a task board, served over HTTP. Each task has buttons that op
 agent session on it ([Claude Code](https://claude.com/claude-code) by default), in the task's own project folder, to reply to
 someone, act on the task or move its Jira ticket to QA. The session reports back to the board through its API.
 
-One Go binary, standard library only; the whole page is `index.html`, embedded at build time.
+One Go binary, standard library plus a TOML parser; the whole page is `index.html`, embedded at build time.
 
 ## How it works
 
@@ -12,8 +12,8 @@ One Go binary, standard library only; the whole page is `index.html`, embedded a
   Every change is also appended to a weekly history log (`log/<monday>.jsonl` next to the state file).
 - **Buttons** (`reply`, `act`, `qa`) start the agent (`HIRDMAN_AGENT`) in that area's folder, in a new wezterm mux tab or window
   (or any terminal, see `HIRDMAN_TERMINAL`), with the task as JSON and the rule for that action.
-- **The brief** runs on a schedule per area (`briefEvery`) or from the page, and fills the board from the
-  area's sources and roadmap files.
+- **The brief** runs on a schedule per area (`briefEvery`) or from the page: each of the area's `runs`, a prompt the
+  agent runs in its folder, or the built-in roadmap run that keeps a task per next item of its roadmap files.
 - **Watchers**, each optional:
   - Jira: reads the kith room where an area's Jira bot posts, and starts an `update` session for each changed
     ticket.
@@ -32,32 +32,57 @@ One Go binary, standard library only; the whole page is `index.html`, embedded a
 
 ```sh
 make build
-HIRDMAN_AREAS='[{"id":"board","name":"Hirdman","dir":"~/dev/hirdman"}]' ./hirdman
+./hirdman
 ```
 
-Then open <http://localhost:8787>. `make run` does the same from source.
+Then open <http://localhost:8787> and add a project in the settings (⚙). `make run` does the same from source.
 
 ## Configuration
 
-Settings come from the environment. Those the page's settings form edits are saved in `settings.json`
-next to the state file, which wins over the environment; saving them restarts the board.
+Settings live in `~/.config/hirdman/config.toml` (`HIRDMAN_CONFIG`); no file is an empty board. The page's settings
+form edits the file and restarts the board. Each setting's env var, when set, wins over the file.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `HIRDMAN_AREAS` | required | JSON list of areas: `{"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery", "issueUrl", "prUrl"}`; the settings form edits it field by field |
-| `HIRDMAN_ADDR` | `:8787` | Listen address |
-| `HIRDMAN_STATE` | `~/.local/state/hirdman/state.json` | State file; logs and `settings.json` live next to it |
-| `HIRDMAN_URL` | `http://localhost` + `HIRDMAN_ADDR` | How sessions reach the board |
-| `HIRDMAN_AGENT` | `claude` | The agent command; it takes Claude Code's flags |
-| `HIRDMAN_TERMINAL` | wezterm mux | A terminal command the session is appended to, e.g. `kitty`, `alacritty -e` |
-| `HIRDMAN_SESSION_IN` | `tab` | wezterm: a new `tab` in the last used window, or its own `window` |
-| `HIRDMAN_BRIEF_EVERY` | off | Default brief interval for areas without `briefEvery` (a Go duration) |
-| `HIRDMAN_JIRA_POLL` | `2m` | How often to read each area's `jiraRoom` |
-| `HIRDMAN_KITH_MCP` | `kith-mcp` | The kith MCP server command |
-| `HIRDMAN_GITHUB_POLL` | off | How often to read GitHub notifications |
-| `HIRDMAN_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the Jira feed and GitHub |
-| `HIRDMAN_ISSUE_URL`, `HIRDMAN_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without `issueUrl` / `prUrl`; an area without `prUrl` first takes its folder's GitHub `origin` |
-| `HIRDMAN_CLEAN_MERGED` | off | `1`: a task done with a merged pull request closes its session and removes the worktree |
+```toml
+briefEvery = "6h"
+githubPoll = "1m"
+
+[[areas]]
+id = "work"
+name = "Work"
+dir = "~/dev/work"
+jiraRoom = "slack:T0000/D0000"
+
+  [[areas.runs]]
+  name = "brief"
+  prompt = """Use the brief skill. This is a scheduled run and nobody is watching."""
+
+[[areas]]
+id = "kith"
+dir = "~/dev/kith"
+roadmap = ["planning/roadmap.md"]
+```
+
+An area: `id` (stored on its tasks), `name` (shown), `dir` (where its sessions and runs run), `roadmap` (globs of the
+files the roadmap run reads; unset is `roadmap.md`, `TODO.md` and the like, `[]` none), `runs` (what its brief is:
+each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no brief), `jiraRoom`, `briefEvery`,
+`issueUrl`, `prUrl`.
+
+| Key | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| | `HIRDMAN_ADDR` | `:8787` | Listen address (env only) |
+| | `HIRDMAN_STATE` | `~/.local/state/hirdman/state.json` | State file; logs live next to it (env only) |
+| | `HIRDMAN_CONFIG` | `~/.config/hirdman/config.toml` | This file (env only) |
+| `url` | `HIRDMAN_URL` | `http://localhost` + `HIRDMAN_ADDR` | How sessions reach the board |
+| `agent` | `HIRDMAN_AGENT` | `claude` | The agent command; it takes Claude Code's flags |
+| `terminal` | `HIRDMAN_TERMINAL` | wezterm mux | A terminal command the session is appended to, e.g. `kitty`, `alacritty -e` |
+| `sessionIn` | `HIRDMAN_SESSION_IN` | `tab` | wezterm: a new `tab` in the last used window, or its own `window` |
+| `briefEvery` | `HIRDMAN_BRIEF_EVERY` | off | Default brief interval for areas without `briefEvery` (a Go duration) |
+| `jiraPoll` | `HIRDMAN_JIRA_POLL` | `2m` | How often to read each area's `jiraRoom` |
+| `kithMcp` | `HIRDMAN_KITH_MCP` | `kith-mcp` | The kith MCP server command |
+| `githubPoll` | `HIRDMAN_GITHUB_POLL` | off | How often to read GitHub notifications |
+| `issueKey` | `HIRDMAN_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the Jira feed and GitHub |
+| `issueUrl`, `prUrl` | `HIRDMAN_ISSUE_URL`, `HIRDMAN_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without their own; an area without `prUrl` first takes its folder's GitHub `origin` |
+| `cleanMerged` | `HIRDMAN_CLEAN_MERGED` | off | `"1"`: a task done with a merged pull request closes its session and removes the worktree |
 
 The comment at the top of `main.go` documents each one in full.
 

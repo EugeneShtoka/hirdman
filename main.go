@@ -2,20 +2,23 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, act, qa). Drop is handled here.
 // The agent command takes Claude Code's flags, hooks and remote control (see spawnSession, runAgent).
 //
-// Env: HIRDMAN_ADDR (:8787), HIRDMAN_STATE (~/.local/state/hirdman/state.json),
-// HIRDMAN_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery", "issueUrl", "prUrl"}, the board's areas and
-// the folders their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see
-// defaultRoadmap; jiraRoom: the kith room the area's Jira bot posts in, see watchJira; briefEvery: how often the area is
-// briefed, a Go duration, default HIRDMAN_BRIEF_EVERY, unset or 0 only by the board's button, see scheduleBrief;
-// issueUrl / prUrl: the area's link bases, default HIRDMAN_ISSUE_URL / HIRDMAN_PR_URL; prUrl first defaults to its folder's GitHub origin),
-// HIRDMAN_AGENT (claude), HIRDMAN_URL (how the agent reaches us),
-// HIRDMAN_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
+// Config: HIRDMAN_CONFIG (~/.config/hirdman/config.toml), see Config: the board's areas, [[areas]] with "id", "name", "dir",
+// "roadmap", "jiraRoom", "briefEvery", "issueUrl", "prUrl" and [[areas.runs]], the board's areas and the folders their
+// sessions run in; roadmap: the files the roadmap run reads, see defaultRoadmap; jiraRoom: the kith room the area's Jira bot
+// posts in, see watchJira; briefEvery: how often the area is briefed, a Go duration, default briefEvery, unset or 0 only by
+// the board's button, see scheduleBrief; issueUrl / prUrl: the area's link bases, default issueUrl / prUrl; prUrl first
+// defaults to its folder's GitHub origin; runs: what its brief is, see Run. And the board's settings, each of which its
+// env var, set, wins over: briefEvery (HIRDMAN_BRIEF_EVERY), jiraPoll (HIRDMAN_JIRA_POLL), githubPoll (HIRDMAN_GITHUB_POLL),
+// issueKey (HIRDMAN_ISSUE_KEY), kithMcp (HIRDMAN_KITH_MCP),
+// agent (HIRDMAN_AGENT: claude), url (HIRDMAN_URL: how the agent reaches us),
+// terminal (HIRDMAN_TERMINAL: where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
-// HIRDMAN_SESSION_IN (tab | window: a wezterm session's new tab in the window last used, or its own window),
-// HIRDMAN_ISSUE_URL / HIRDMAN_PR_URL (link bases for issue keys and #PR numbers in the page, for areas without their own),
-// HIRDMAN_CLEAN_MERGED (1: a task moving to done with a merged pull request closes its session and removes the
-// pull request's worktree, see cleanMerged).
-// The page's settings (settingKeys) are saved in settings.json next to the state file and win over the env, see applySettings.
+// sessionIn (HIRDMAN_SESSION_IN: tab | window: a wezterm session's new tab in the window last used, or its own window),
+// issueUrl / prUrl (HIRDMAN_ISSUE_URL / HIRDMAN_PR_URL: link bases for issue keys and #PR numbers in the page, for areas
+// without their own), cleanMerged (HIRDMAN_CLEAN_MERGED: "1": a task moving to done with a merged pull request closes its
+// session and removes the pull request's worktree, see cleanMerged).
+// Env only: HIRDMAN_ADDR (:8787), HIRDMAN_STATE (~/.local/state/hirdman/state.json).
+// The page's settings form edits config.toml, see handleSaveSettings.
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
 
@@ -30,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"mime/multipart"
@@ -45,6 +49,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 //go:embed index.html
@@ -84,7 +90,7 @@ type Task struct {
 	Title      string              `json:"title"`
 	Group      string              `json:"group"`            // waiting_on_you | ready | roadmap; urgency and status say what is urgent, later or waiting
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
-	Area       string              `json:"area,omitempty"`   // an id from HIRDMAN_AREAS, required
+	Area       string              `json:"area,omitempty"`   // an id from config.toml's areas, required
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats) | roadmap (an area's roadmap files)
 	Who        string              `json:"who,omitempty"`
 	WaitingFor string              `json:"waitingFor,omitempty"` // what is owed between Eugene and who: a review, an email reply, a Jira answer, info
@@ -140,7 +146,6 @@ type Board struct {
 	path     string
 	logDir   string
 	st       State
-	workdir  string
 	home     string
 	agent    string
 	terminal []string // HIRDMAN_TERMINAL; empty is the wezterm mux
@@ -153,8 +158,10 @@ type Board struct {
 	ghOwn    string            // pollOwn's own: the ETag of its last events answer
 	ghLogin  string            // the gh user, read once by pollOwn
 	clean    bool              // HIRDMAN_CLEAN_MERGED
-	areas    []Area            // HIRDMAN_AREAS
-	env      map[string]string // the service's env, before settings.json; a saved setting equal to it is dropped from the file
+	areas    []Area            // config.toml's, parsed
+	conf     Config            // config.toml as read, which the settings page edits
+	confPath string            // HIRDMAN_CONFIG
+	env      map[string]string // the service's env, before config.toml; a setting it has wins over the file
 	restart  chan struct{}     // a saved setting: main restarts the board to apply it
 
 	asks map[string]chan []byte // task id -> its session's waiting question, which takes the hook's reply
@@ -164,21 +171,38 @@ type Board struct {
 var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Area is one area of the board: its id (what a task stores), the name the page shows, the folder its sessions run in,
-// the globs, relative to that folder, of the files the roadmap run reads for its next items, and the kith room its Jira
-// bot posts in, if it has a Jira, and how often it is briefed.
+// the globs, relative to that folder, of the files the roadmap run reads for its next items, the runs its brief is, and
+// the kith room its Jira bot posts in, if it has a Jira, and how often it is briefed.
 type Area struct {
-	ID         string        `json:"id"`
-	Name       string        `json:"name"`
-	Dir        string        `json:"dir"`
-	Roadmap    []string      `json:"roadmap"`
-	JiraRoom   string        `json:"jiraRoom,omitempty"`
-	BriefEvery string        `json:"briefEvery,omitempty"`
-	IssueURL   string        `json:"issueUrl,omitempty"`
-	PRURL      string        `json:"prUrl,omitempty"`
+	ID         string        `json:"id" toml:"id"`
+	Name       string        `json:"name" toml:"name,omitempty"`
+	Dir        string        `json:"dir" toml:"dir"`
+	Roadmap    []string      `json:"roadmap" toml:"roadmap"`
+	Runs       []Run         `json:"runs" toml:"runs"`
+	JiraRoom   string        `json:"jiraRoom,omitempty" toml:"jiraRoom,omitempty"`
+	BriefEvery string        `json:"briefEvery,omitempty" toml:"briefEvery,omitempty"`
+	IssueURL   string        `json:"issueUrl,omitempty" toml:"issueUrl,omitempty"`
+	PRURL      string        `json:"prUrl,omitempty" toml:"prUrl,omitempty"`
 	every      time.Duration // BriefEvery, parsed; 0 is never on schedule
 }
 
-// defaultRoadmap is an area's roadmap when HIRDMAN_AREAS gives it none; "roadmap": [] reads no files.
+// Run is one agent run of an area's brief: Prompt, run in the area's folder, or the built-in "roadmap" run, which keeps a
+// task per next item of the area's roadmap files. Name is what the board's log calls it.
+type Run struct {
+	Name    string `json:"name,omitempty" toml:"name,omitempty"`
+	Prompt  string `json:"prompt,omitempty" toml:"prompt,omitempty"`
+	Builtin string `json:"builtin,omitempty" toml:"builtin,omitempty"`
+}
+
+// badRun says r is neither a prompt nor the roadmap run.
+func badRun(r Run) bool {
+	return (r.Prompt == "") == (r.Builtin == "") || r.Builtin != "" && r.Builtin != "roadmap"
+}
+
+// defaultRuns is an area's brief when config.toml gives it no runs: its roadmap files; runs = [] is no brief.
+var defaultRuns = []Run{{Builtin: "roadmap"}}
+
+// defaultRoadmap is an area's roadmap when config.toml gives it none; roadmap = [] reads no files.
 var defaultRoadmap = []string{"roadmap.md", "ROADMAP.md", "roadmap.txt", "plan.md", "PLAN.md", "plan.txt", "todo.md", "TODO.md", "todo.txt"}
 
 // roadmapFiles is the files a's roadmap globs match, each once.
@@ -195,16 +219,10 @@ func (a *Area) roadmapFiles() []string {
 	return files
 }
 
-// parseAreas reads HIRDMAN_AREAS, a JSON list of areas, each with its folder; work is required, since tasks from
-// before areas were required are work, and the brief runs there. A missing name is the id; a dir of "~" or "~/..." is at home.
-func (b *Board) parseAreas(conf string) ([]Area, error) {
-	var areas []Area
-	if conf == "" {
-		return nil, errors.New("parseAreas: HIRDMAN_AREAS is not set")
-	}
-	if err := json.Unmarshal([]byte(conf), &areas); err != nil {
-		return nil, fmt.Errorf("parseAreas: %w", err)
-	}
+// parseAreas checks config.toml's areas, each with its folder, and fills in their defaults. A missing name is the id; a dir
+// of "~" or "~/..." is at home.
+func (b *Board) parseAreas(conf []Area) ([]Area, error) {
+	areas := slices.Clone(conf)
 	seen := map[string]bool{}
 	for i := range areas {
 		a := &areas[i]
@@ -220,6 +238,12 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		if a.Roadmap == nil {
 			a.Roadmap = defaultRoadmap
 		}
+		if a.Runs == nil {
+			a.Runs = defaultRuns
+		}
+		if i := slices.IndexFunc(a.Runs, badRun); i >= 0 {
+			return nil, fmt.Errorf("parseAreas: %s: run %d: want a prompt or builtin = \"roadmap\"", a.ID, i+1)
+		}
 		if every := cmp.Or(a.BriefEvery, os.Getenv("HIRDMAN_BRIEF_EVERY")); every != "" {
 			var err error
 			if a.every, err = time.ParseDuration(every); err != nil {
@@ -233,9 +257,6 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		if a.PRURL == "" {
 			a.PRURL = cmp.Or(repoPulls(a.Dir), os.Getenv("HIRDMAN_PR_URL"))
 		}
-	}
-	if !seen["work"] {
-		return nil, errors.New("parseAreas: no work area")
 	}
 	return areas, nil
 }
@@ -261,7 +282,7 @@ func repoPulls(dir string) string {
 func (b *Board) dirFor(t *Task) (string, error) {
 	i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == t.Area })
 	if i < 0 {
-		return "", fmt.Errorf("dirFor: no area %q in HIRDMAN_AREAS", t.Area)
+		return "", fmt.Errorf("dirFor: no area %q in config.toml", t.Area)
 	}
 	if fi, err := os.Stat(b.areas[i].Dir); err != nil || !fi.IsDir() {
 		return "", fmt.Errorf("dirFor: area %s: %s is not a folder", t.Area, b.areas[i].Dir)
@@ -470,7 +491,7 @@ func (b *Board) handleBriefRun(w http.ResponseWriter, r *http.Request) {
 	for _, id := range body.Areas {
 		i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == id })
 		if i < 0 {
-			writeJSON(w, 400, map[string]string{"error": "areas: no area " + id + " in HIRDMAN_AREAS"})
+			writeJSON(w, 400, map[string]string{"error": "areas: no area " + id + " in config.toml"})
 			return
 		}
 		if b.briefs(&b.areas[i]) && !b.briefing(id) {
@@ -539,7 +560,7 @@ func (b *Board) badField(t *Task) string {
 	levels := []string{"high", "medium", "low"}
 	switch {
 	case !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
-		return "area: required, an id from HIRDMAN_AREAS"
+		return "area: required, an id from config.toml's areas"
 	case goneGroups[t.Group] != "":
 		return fmt.Sprintf("group: %q is gone, set %s", t.Group, goneGroups[t.Group])
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
@@ -1174,8 +1195,11 @@ func (b *Board) start(t *Task, req actRequest) {
 	}
 	prompt, err := b.prompt(t, req)
 	if err == nil && req.Action == "update" {
-		go b.run(t.ID, req.Action, prompt, prev)
-		return
+		var dir string
+		if dir, err = b.dirFor(t); err == nil {
+			go b.run(t.ID, dir, req.Action, prompt, prev)
+			return
+		}
 	}
 	verb := "Started"
 	switch {
@@ -1509,9 +1533,10 @@ func (b *Board) logf(kind, format string, args ...any) {
 	}
 }
 
-// run is a Jira update's headless run; prev is the task's job before it, whose session the task keeps for its next Act.
-func (b *Board) run(id, action, prompt string, prev *Job) {
-	status, text := runAgent(b.agent, b.workdir, prompt)
+// run is a Jira update's headless run in the task's folder; prev is the task's job before it, whose session the task keeps
+// for its next Act.
+func (b *Board) run(id, dir, action, prompt string, prev *Job) {
+	status, text := runAgent(b.agent, dir, prompt)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1630,11 +1655,17 @@ func (b *Board) routes() *http.ServeMux {
 	return mux
 }
 
-func main() {
+func main() { //nolint:funlen // one setup step after another
 	home, _ := os.UserHomeDir()
+	confDir, _ := os.UserConfigDir()
 	addr := env("HIRDMAN_ADDR", ":8787")
 	path := env("HIRDMAN_STATE", filepath.Join(home, ".local", "state", "hirdman", "state.json"))
-	base := applySettings(settingsPath(path))
+	confPath := env("HIRDMAN_CONFIG", filepath.Join(confDir, "hirdman", "config.toml"))
+	conf, err := loadConfig(confPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	base := applyConfig(&conf)
 	b := &Board{
 		path:     path,
 		home:     home,
@@ -1645,16 +1676,16 @@ func main() {
 		selfURL:  env("HIRDMAN_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
+		conf:     conf,
+		confPath: confPath,
 		env:      base,
 		restart:  make(chan struct{}, 1),
 	}
-	areas, err := b.parseAreas(os.Getenv("HIRDMAN_AREAS"))
-	if err != nil {
-		log.Fatal(err)
+	if b.areas, err = b.checkConfig(&conf); err != nil {
+		log.Fatalf("%s: %v", confPath, err)
 	}
-	b.areas = areas
-	if b.workdir, err = b.dirFor(&Task{Area: "work"}); err != nil {
-		log.Fatal(err)
+	if len(b.areas) == 0 {
+		log.Printf("%s has no areas yet: add them on the settings page", confPath)
 	}
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
 		log.Fatal(err)
@@ -1697,9 +1728,9 @@ func main() {
 }
 
 // serve answers until a saved setting asks for a restart; then the board runs itself again, the same process, with the
-// service's env and the new settings.json.
+// service's env and the new config.toml.
 func (b *Board) serve(addr string) {
-	log.Printf("hirdman on %s, state %s, the agent runs in %s", addr, b.path, b.workdir)
+	log.Printf("hirdman on %s, state %s, config %s", addr, b.path, b.confPath)
 	srv := &http.Server{Addr: addr, Handler: b.routes(), ReadHeaderTimeout: 10 * time.Second}
 	stopped := make(chan struct{})
 	go func() {
@@ -1728,70 +1759,112 @@ func (b *Board) serve(addr string) {
 	log.Fatal(syscall.Exec(exe, os.Args, envList)) //nolint:gosec // the board's own binary and argv
 }
 
-// settingKeys are the settings the page edits. HIRDMAN_ADDR and HIRDMAN_STATE it only shows: one moves the page, the other is
-// where settings.json lives.
-var settingKeys = []string{"HIRDMAN_AREAS", "HIRDMAN_BRIEF_EVERY", "HIRDMAN_JIRA_POLL", "HIRDMAN_GITHUB_POLL", "HIRDMAN_ISSUE_KEY",
-	"HIRDMAN_KITH_MCP", "HIRDMAN_AGENT", "HIRDMAN_TERMINAL", "HIRDMAN_SESSION_IN", "HIRDMAN_CLEAN_MERGED", "HIRDMAN_ISSUE_URL",
-	"HIRDMAN_PR_URL", "HIRDMAN_URL"}
+// Config is config.toml: the board's areas and its settings. Each setting has an env var, HIRDMAN_..., which wins over
+// the file when set; see settings.
+type Config struct {
+	BriefEvery  string `toml:"briefEvery,omitempty"`
+	JiraPoll    string `toml:"jiraPoll,omitempty"`
+	GitHubPoll  string `toml:"githubPoll,omitempty"`
+	IssueKey    string `toml:"issueKey,omitempty"`
+	KithMCP     string `toml:"kithMcp,omitempty"`
+	Agent       string `toml:"agent,omitempty"`
+	Terminal    string `toml:"terminal,omitempty"`
+	SessionIn   string `toml:"sessionIn,omitempty"`
+	CleanMerged string `toml:"cleanMerged,omitempty"`
+	IssueURL    string `toml:"issueUrl,omitempty"`
+	PRURL       string `toml:"prUrl,omitempty"`
+	URL         string `toml:"url,omitempty"`
+	Areas       []Area `toml:"areas"`
+}
 
-func settingsPath(state string) string { return filepath.Join(filepath.Dir(state), "settings.json") }
+// settings is c's settings by their env var: the settings page's keys, and what the rest of the board reads.
+func (c *Config) settings() map[string]*string {
+	return map[string]*string{"HIRDMAN_BRIEF_EVERY": &c.BriefEvery, "HIRDMAN_JIRA_POLL": &c.JiraPoll, "HIRDMAN_GITHUB_POLL": &c.GitHubPoll,
+		"HIRDMAN_ISSUE_KEY": &c.IssueKey, "HIRDMAN_KITH_MCP": &c.KithMCP, "HIRDMAN_AGENT": &c.Agent, "HIRDMAN_TERMINAL": &c.Terminal,
+		"HIRDMAN_SESSION_IN": &c.SessionIn, "HIRDMAN_CLEAN_MERGED": &c.CleanMerged, "HIRDMAN_ISSUE_URL": &c.IssueURL,
+		"HIRDMAN_PR_URL": &c.PRURL, "HIRDMAN_URL": &c.URL}
+}
 
-// applySettings sets the env from settings.json, {"HIRDMAN_...": value}, before anything reads it, and returns the env from
-// before. No file is no settings; a broken one is logged and left out rather than fatal, so the page comes up to fix it.
-func applySettings(path string) (before map[string]string) {
+// loadConfig reads config.toml; no file is an empty config, which the settings page fills. An unknown key is refused,
+// as a typo would otherwise read as unset.
+func loadConfig(path string) (Config, error) {
+	var c Config
+	md, err := toml.DecodeFile(path, &c)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Config{}, nil
+	case err != nil:
+		return c, fmt.Errorf("loadConfig: %w", err)
+	case len(md.Undecoded()) > 0:
+		return c, fmt.Errorf("loadConfig: %s: unknown key %s", path, md.Undecoded()[0])
+	}
+	return c, nil
+}
+
+// applyConfig sets the env from c's settings the env doesn't set itself, before anything reads it, and returns the env from
+// before.
+func applyConfig(c *Config) (before map[string]string) {
 	before = map[string]string{}
 	for _, kv := range os.Environ() {
 		k, v, _ := strings.Cut(kv, "=")
 		before[k] = v
 	}
-	var set map[string]string
-	data, err := os.ReadFile(path) //nolint:gosec // settings.json next to the board's own state file
-	if err == nil {
-		err = json.Unmarshal(data, &set)
-	}
-	if err != nil && !os.IsNotExist(err) {
-		log.Printf("applySettings: %s: %v", path, err)
-	}
-	for k, v := range set {
-		if slices.Contains(settingKeys, k) {
-			if err := os.Setenv(k, v); err != nil {
-				log.Printf("applySettings: %v", err)
+	for k, v := range c.settings() {
+		if before[k] == "" && *v != "" {
+			if err := os.Setenv(k, *v); err != nil {
+				log.Printf("applyConfig: %v", err)
 			}
 		}
 	}
 	return before
 }
 
-// handleSettings answers every setting as the board runs with it, and as the service's env has it.
+// handleSettings answers every setting as the board runs with it, and as the service's env has it; the areas as
+// config.toml has them.
 func (b *Board) handleSettings(w http.ResponseWriter, r *http.Request) {
-	now, env := map[string]string{"HIRDMAN_STATE": b.path}, map[string]string{"HIRDMAN_STATE": b.env["HIRDMAN_STATE"]}
-	for _, k := range append(slices.Clone(settingKeys), "HIRDMAN_ADDR") {
+	areas, err := json.Marshal(b.conf.Areas)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": fmt.Sprintf("handleSettings: %v", err)})
+		return
+	}
+	now := map[string]string{"HIRDMAN_STATE": b.path, "HIRDMAN_CONFIG": b.confPath, "HIRDMAN_AREAS": string(areas)}
+	env := map[string]string{"HIRDMAN_STATE": b.env["HIRDMAN_STATE"], "HIRDMAN_CONFIG": b.env["HIRDMAN_CONFIG"]}
+	for k := range b.conf.settings() {
 		now[k], env[k] = os.Getenv(k), b.env[k]
 	}
+	now["HIRDMAN_ADDR"], env["HIRDMAN_ADDR"] = os.Getenv("HIRDMAN_ADDR"), b.env["HIRDMAN_ADDR"]
 	writeJSON(w, 200, map[string]any{"settings": now, "env": env})
 }
 
-// handleSaveSettings saves the settings sent over the current ones, keeping in settings.json only those that differ from
-// the env, then restarts the board. A value the board would refuse at start is refused here, or the restart would loop on
-// it; so is a save while the agent runs headless, which the restart would cut off.
+// handleSaveSettings writes the settings and areas sent ({"HIRDMAN_...": value, "HIRDMAN_AREAS": a JSON list}) over
+// config.toml's, then restarts the board. A value the board would refuse at start is refused here, or the restart would
+// loop on it; so is a save while the agent runs headless, which the restart would cut off.
+// shortcut: the file is written anew: its comments are lost and multi-line prompts come out as one escaped line; write it
+// back with its own formatting once the page edits runs.
 func (b *Board) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	var body map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	set := map[string]string{}
-	for _, k := range settingKeys {
-		set[k] = os.Getenv(k)
-	}
+	c := b.conf
+	set := c.settings()
 	for k, v := range body {
-		if !slices.Contains(settingKeys, k) {
+		switch p, ok := set[k]; {
+		case k == "HIRDMAN_AREAS":
+			c.Areas = nil
+			if err := json.Unmarshal([]byte(v), &c.Areas); err != nil {
+				writeJSON(w, 400, map[string]string{"error": "HIRDMAN_AREAS: " + err.Error()})
+				return
+			}
+		case !ok:
 			writeJSON(w, 400, map[string]string{"error": "no setting " + k})
 			return
+		default:
+			*p = strings.TrimSpace(v)
 		}
-		set[k] = strings.TrimSpace(v)
 	}
-	if err := b.checkSettings(set); err != nil {
+	if _, err := b.checkConfig(&c); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1801,15 +1874,7 @@ func (b *Board) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]string{"error": "The agent is running a brief, a triage or a task; save once it ends"})
 		return
 	}
-	maps.DeleteFunc(set, func(k, v string) bool { return v == b.env[k] })
-	data, err := json.MarshalIndent(set, "", "  ")
-	if err == nil {
-		tmp := settingsPath(b.path) + ".tmp"
-		if err = os.WriteFile(tmp, data, 0o600); err == nil {
-			err = os.Rename(tmp, settingsPath(b.path))
-		}
-	}
-	if err != nil {
+	if err := writeConfig(b.confPath, &c); err != nil {
 		writeJSON(w, 500, map[string]string{"error": fmt.Sprintf("handleSaveSettings: %v", err)})
 		return
 	}
@@ -1820,25 +1885,39 @@ func (b *Board) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// checkSettings refuses what main would stop on, or read as off without a word: a bad duration, key pattern or area list.
-func (b *Board) checkSettings(set map[string]string) error {
-	for _, k := range []string{"HIRDMAN_BRIEF_EVERY", "HIRDMAN_JIRA_POLL", "HIRDMAN_GITHUB_POLL"} {
-		if _, err := time.ParseDuration(set[k]); set[k] != "" && err != nil {
-			return fmt.Errorf("%s: %w", k, err)
+// writeConfig writes c to path, through a temporary file so a start never reads half of it.
+func writeConfig(path string, c *Config) error {
+	var data bytes.Buffer
+	if err := toml.NewEncoder(&data).Encode(c); err != nil {
+		return fmt.Errorf("writeConfig: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("writeConfig: %w", err)
+	}
+	if err := os.WriteFile(path+".tmp", data.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("writeConfig: %w", err)
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return fmt.Errorf("writeConfig: %w", err)
+	}
+	return nil
+}
+
+// checkConfig refuses what main would stop on, or read as off without a word: a bad duration, key pattern or area; it
+// returns the areas parsed.
+func (b *Board) checkConfig(c *Config) ([]Area, error) {
+	for k, v := range map[string]string{"briefEvery": c.BriefEvery, "jiraPoll": c.JiraPoll, "githubPoll": c.GitHubPoll} {
+		if _, err := time.ParseDuration(v); v != "" && err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
 		}
 	}
-	if _, err := regexp.Compile(set["HIRDMAN_ISSUE_KEY"]); err != nil {
-		return fmt.Errorf("HIRDMAN_ISSUE_KEY: %w", err)
+	if _, err := regexp.Compile(c.IssueKey); err != nil {
+		return nil, fmt.Errorf("issueKey: %w", err)
 	}
-	if s := set["HIRDMAN_SESSION_IN"]; s != "" && s != "tab" && s != "window" {
-		return fmt.Errorf("HIRDMAN_SESSION_IN: %q, want tab or window", s)
+	if c.SessionIn != "" && c.SessionIn != "tab" && c.SessionIn != "window" {
+		return nil, fmt.Errorf("sessionIn: %q, want tab or window", c.SessionIn)
 	}
-	areas, err := b.parseAreas(set["HIRDMAN_AREAS"])
-	if err != nil {
-		return err
-	}
-	_, err = (&Board{areas: areas}).dirFor(&Task{Area: "work"})
-	return err
+	return b.parseAreas(c.Areas)
 }
 
 // headless says whether the agent runs without a session: a brief, a triage or a task's run. The caller holds b.mu.
