@@ -911,9 +911,16 @@ func endsWithPulls(waitingFor string) bool {
 	return waitingFor == "" || reviewRe.MatchString(waitingFor)
 }
 
-// doneNow is t moving to done: with HIRDMAN_CLEAN_MERGED, what its merged pull requests leave behind
-// goes (see cleanMerged); callers hold mu.
+// doneNow is t moving to done: its Jira tickets are checked to have moved on too (see checkJira), and with
+// HIRDMAN_CLEAN_MERGED, what its merged pull requests leave behind goes (see cleanMerged); callers hold mu.
 func (b *Board) doneNow(t *Task) {
+	if len(t.Jira) > 0 {
+		if dir, err := b.dirFor(t); err != nil {
+			b.note(t, "board", "qa", "No Jira check: "+err.Error())
+		} else {
+			go b.checkJira(t.ID, t.Title, dir, t.Jira)
+		}
+	}
 	pages := taskPulls(t)
 	if !b.clean || len(pages) == 0 {
 		return
@@ -929,6 +936,31 @@ func (b *Board) doneNow(t *Task) {
 		return
 	}
 	go b.cleanMerged(t.ID, dir, pane, pages)
+}
+
+// checkJira runs once a task is done: an agent run in the task's folder (dir) reads each of its Jira keys live and
+// moves one still before QA on, the way the qa action does, noting on task id what it found. It leaves the task's
+// session alone, so a session that closed its own task keeps working.
+func (b *Board) checkJira(id, title, dir string, keys []string) {
+	prompt := fmt.Sprintf(`The task %[1]q on Eugene's Hirdman board (%[2]s) was just closed as done. Nobody is watching this run.
+
+Its Jira tickets should have moved on with it. Read the status of each in Jira now: %[3]s. One still before QA
+(backlog, to do, in progress, dev done) moves to "QA - Staging" (read its transitions first); a sub-task that has no
+QA state goes straight to Done. Leave a ticket in QA or past it as it is, and change nothing else in Jira or on the board.
+Then record each key's status now:
+  curl -s -X PUT %[2]s/api/tasks/%[4]s -H 'Content-Type: application/json' -d '{"jiraStatus": {"<KEY>": "<status now>"}}'
+Your final message goes into the task's history as is: one line per key, its status and whether you moved it.`,
+		title, b.selfURL, strings.Join(keys, ", "), id)
+	status, text := runAgent(b.agent, dir, prompt)
+	if status != "ok" {
+		text = "Jira check failed: " + text
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t := b.st.Tasks[id]; t != nil {
+		b.note(t, "agent", "qa", text)
+		b.saveOrLog()
+	}
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
