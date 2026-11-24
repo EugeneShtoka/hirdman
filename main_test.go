@@ -103,10 +103,10 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, brief, "", "", "", "https://github.com/o/work/pull/", 6 * time.Hour},
-		{"kith", "Kith", kith, defaultRoadmap, defaultRuns, "", "1h", "https://kith/issues/", "https://kith/pull/", time.Hour},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, []Run{}, "", "", "", "https://env/pull/", 6 * time.Hour},
-		{"personal", "Personal", "/home", defaultRoadmap, defaultRuns, "", "0", "", "https://env/pull/", 0}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, brief, "", "", "", "https://github.com/o/work/pull/", Use{}, 6 * time.Hour},
+		{"kith", "Kith", kith, defaultRoadmap, defaultRuns, "", "1h", "https://kith/issues/", "https://kith/pull/", Use{}, time.Hour},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, []Run{}, "", "", "", "https://env/pull/", Use{}, 6 * time.Hour},
+		{"personal", "Personal", "/home", defaultRoadmap, defaultRuns, "", "0", "", "https://env/pull/", Use{}, 0}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
@@ -320,8 +320,8 @@ func TestUpsertSummaryHistory(t *testing.T) {
 func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
-	b := &Board{agent: "claude", selfURL: "http://board", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
-	pane, err := b.spawnSession(dir, "t'1", "s1", "--session-id", "u1", "do it")
+	b := &Board{selfURL: "http://board", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
+	pane, err := b.spawnSession(defaultAgents["opus"], dir, "t'1", "s1", "--session-id", "u1", "do it")
 	if err != nil || pane != "" {
 		t.Fatalf("spawnSession = %q, %v; want no pane, no error", pane, err)
 	}
@@ -336,7 +336,7 @@ func TestSpawnSessionTerminal(t *testing.T) {
 	session := `[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/session' -H 'Content-Type: application/json' --data-binary @-","type":"command"}]}]`
 	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}],` +
 		`"SessionEnd":` + session + `,"Stop":` + session + `,"StopFailure":` + session + `}}`
-	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\n--session-id\nu1\ndo it\n"
+	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\n--model\nopus\n--session-id\nu1\ndo it\n"
 	if string(out) != want {
 		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
 	}
@@ -475,7 +475,7 @@ func TestActKeepsOneSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "claude", areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
 	b.st.Tasks = map[string]*Task{
 		"a": {ID: "a", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}}},
 		"b": {ID: "b", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "b-act", SessionID: "id-b"}},
@@ -527,9 +527,9 @@ func TestActKeepsOneSession(t *testing.T) {
 // A Jira update's headless run ends with the task still holding its session, so Act goes on in it, not in a new one.
 func TestUpdateKeepsSession(t *testing.T) {
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "true"}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
 	b.st.Tasks = map[string]*Task{"a": {ID: "a", Job: &Job{Action: "update", Status: "running", SessionID: "id-a"}}}
-	b.run("a", dir, "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}})
+	b.run(Agent{Command: "true"}, "a", dir, "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}})
 	if j := b.st.Tasks["a"].Job; j.Status == "running" || j.Session != "a-act" || j.Pane != "7" || j.SessionID != "id-a" || !slices.Equal(j.Rules, []string{"act"}) {
 		t.Errorf("job after the update = %+v, want it ended, still on session a-act in pane 7 with id-a", j)
 	}
@@ -538,11 +538,12 @@ func TestUpdateKeepsSession(t *testing.T) {
 // Closing a task with Jira keys runs the agent in its folder to move them on; one without keys runs nothing.
 func TestCloseChecksJira(t *testing.T) {
 	dir := t.TempDir()
-	fake := "#!/bin/sh\npwd > " + dir + "/ran; printf '%s' \"$2\" > " + dir + "/prompt\necho '{\"type\":\"result\",\"result\":\"BE-1: QA - Staging, moved\"}'\n"
+	fake := "#!/bin/sh\npwd > " + dir + "/ran; printf '%s' \"$2\" > " + dir + "/prompt; for a; do m=$a; done; echo $m > " + dir + "/model\necho '{\"type\":\"result\",\"result\":\"BE-1: QA - Staging, moved\"}'\n"
 	if err := os.WriteFile(filepath.Join(dir, "agent"), []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: filepath.Join(dir, "agent"), areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}},
+		conf: Config{Agents: map[string]Agent{"haiku": {Command: filepath.Join(dir, "agent"), Model: "haiku"}}}}
 	b.st.Tasks = map[string]*Task{
 		"j":  {ID: "j", Title: "Fix it", Area: "work", Status: "waiting", Jira: []string{"BE-1"}},
 		"no": {ID: "no", Area: "work", Status: "waiting"},
@@ -572,6 +573,9 @@ func TestCloseChecksJira(t *testing.T) {
 	}
 	if prompt, _ := os.ReadFile(filepath.Join(dir, "prompt")); !strings.Contains(string(prompt), "now: BE-1.") {
 		t.Errorf("prompt %q doesn't name BE-1", prompt)
+	}
+	if model, _ := os.ReadFile(filepath.Join(dir, "model")); string(model) != "haiku\n" {
+		t.Errorf("Jira check ran on model %q, want the light one, haiku", model)
 	}
 	if h := b.st.Tasks["no"].History; slices.ContainsFunc(h, func(e Entry) bool { return e.Kind == "qa" }) {
 		t.Errorf("a task without Jira keys got a check: %+v", h)
@@ -748,7 +752,7 @@ func TestReapSessions(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "claude", areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
 	b.st.Tasks = map[string]*Task{
 		"live":    {ID: "live", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s1", Pane: "7"}},
 		"dead":    {ID: "dead", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
@@ -1110,7 +1114,7 @@ esac`
 		}
 	}
 
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: "claude", terminal: []string{"true"},
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, terminal: []string{"true"},
 		areas: []Area{{ID: "work", Dir: dir}}}
 	pr := []map[string]string{{"url": "https://github.com/o/r/pull/1"}}
 	past, future := time.Now().Add(-time.Minute), time.Now().Add(time.Hour)
@@ -1221,19 +1225,21 @@ func TestRunBriefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := filepath.Join(dir, "agent")
-	fake := "#!/bin/sh\nprintf '%s %.20s\\n' \"$PWD\" \"$2\" >> " + dir + "/calls\necho '{\"type\":\"result\",\"result\":\"done\"}'\n"
+	fake := "#!/bin/sh\nfor a; do m=$a; done; printf '%s %.20s %s\\n' \"$PWD\" \"$2\" \"$m\" >> " + dir + "/calls\necho '{\"type\":\"result\",\"result\":\"done\"}'\n"
 	if err := os.WriteFile(agent, []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: agent, home: dir, areas: []Area{
-		{ID: "work", Dir: work, Runs: []Run{{Name: "brief", Prompt: "Use the brief skill."}, {Builtin: "roadmap"}}},
+	conf := Config{Agents: map[string]Agent{"opus": {Command: agent, Model: "opus"}, "haiku": {Command: agent, Model: "haiku"}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, conf: conf, home: dir, areas: []Area{
+		{ID: "work", Dir: work, Runs: []Run{{Name: "brief", Prompt: "Use the brief skill.", Agent: "haiku"}, {Builtin: "roadmap"}}},
 		{ID: "kith", Dir: kith, Roadmap: defaultRoadmap, Runs: defaultRuns},
 		{ID: "personal", Dir: dir, Runs: []Run{{Name: "sweep", Prompt: "Use the sweep skill."}}}}}
 	now := time.Now()
 	b.st.Briefs = map[string]*Job{"work": {StartedAt: now}, "kith": {StartedAt: now}, "personal": {StartedAt: now}}
 	b.runBriefs([]string{"work", "kith"})
 	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
-	if want := work + " Use the brief skill.\n" + dir + " Keep Eugene's Hirdma\n"; string(calls) != want {
+	// The work brief runs on its own agent, the roadmap run on the board's headless one.
+	if want := work + " Use the brief skill. haiku\n" + dir + " Keep Eugene's Hirdma opus\n"; string(calls) != want {
 		t.Errorf("runs:\n%s\nwant:\n%s", calls, want)
 	}
 	if b.st.Briefs["work"].Status != "ok" || b.st.Briefs["kith"].Status != "ok" || b.st.Briefs["personal"].EndedAt != nil {
@@ -1354,5 +1360,42 @@ func TestReportEndsJob(t *testing.T) {
 		if got, want := b.st.Tasks["t1"].Job.Status, map[bool]string{true: "running", false: "ok"}[actor == "eugene"]; rec.Code != 200 || got != want {
 			t.Errorf("%s's report: %d, job %s; want 200, job %s", actor, rec.Code, got, want)
 		}
+	}
+}
+
+// A job runs on its run's agent, else its area's [use], else the board's, else the built-in one; config.toml's [agents]
+// add to and override the built-in ones, and a name in no [agents], or another kind, is refused.
+func TestAgentFor(t *testing.T) {
+	fast := Agent{Kind: "claude-code", Model: "sonnet"}
+	b := &Board{conf: Config{Agents: map[string]Agent{"fast": fast}, Use: Use{Decide: "opus"}},
+		areas: []Area{{ID: "w", Use: Use{Session: "fast"}}}}
+	for _, c := range []struct {
+		job, area, run string
+		want           Agent
+	}{
+		{"session", "w", "", fast},
+		{"session", "x", "", defaultAgents["opus"]},
+		{"decide", "w", "", defaultAgents["opus"]},
+		{"headless", "w", "haiku", defaultAgents["haiku"]},
+	} {
+		if got := b.agentFor(c.job, c.area, c.run); got != c.want {
+			t.Errorf("agentFor(%q, %q, %q) = %+v, want %+v", c.job, c.area, c.run, got, c.want)
+		}
+	}
+	if got := (&Board{}).agentFor("decide", "", ""); got != defaultAgents["haiku"] {
+		t.Errorf("default decide agent = %+v, want haiku", got)
+	}
+	for _, c := range []Config{
+		{Use: Use{Session: "nope"}},
+		{Areas: []Area{{ID: "w", Dir: "/", Use: Use{Decide: "nope"}}}},
+		{Areas: []Area{{ID: "w", Dir: "/", Runs: []Run{{Prompt: "p", Agent: "nope"}}}}},
+		{Agents: map[string]Agent{"x": {Kind: "cli"}}},
+	} {
+		if _, err := b.checkConfig(&c); err == nil {
+			t.Errorf("checkConfig(%+v) took it", c)
+		}
+	}
+	if _, err := b.checkConfig(&Config{Agents: map[string]Agent{"fast": fast}, Use: Use{Session: "fast", Decide: "opus"}}); err != nil {
+		t.Errorf("checkConfig refused known agents: %v", err)
 	}
 }

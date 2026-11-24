@@ -246,7 +246,7 @@ commented on or is blocked by), add it to the board with area %[4]q, in the brie
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
 Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID)
-	status, text := runAgent(b.agent, area.Dir, prompt)
+	status, text := runAgent(b.agentFor("decide", area.ID, ""), area.Dir, prompt)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("triage", "%s (%s): %s", key, status, text)
@@ -286,8 +286,8 @@ func (b *Board) scheduleBrief() {
 // runs failed.
 func (b *Board) runBriefs(due []string) {
 	status := map[string]string{}
-	run := func(kind, dir, prompt string, ids ...string) {
-		s, text := runAgent(b.agent, dir, prompt)
+	run := func(ag Agent, kind, dir, prompt string, ids ...string) {
+		s, text := runAgent(ag, dir, prompt)
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.logf(kind, "%s: %s", s, text)
@@ -308,12 +308,12 @@ func (b *Board) runBriefs(due []string) {
 			if r.Builtin == "roadmap" {
 				roadmap = append(roadmap, a.ID)
 			} else {
-				run(cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, a.ID)
+				run(b.agentFor("headless", a.ID, r.Agent), cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, a.ID)
 			}
 		}
 	}
 	if prompt, ids := b.roadmapPrompt(roadmap); prompt != "" {
-		run("roadmap", b.home, prompt, ids...)
+		run(b.agentFor("headless", "", ""), "roadmap", b.home, prompt, ids...)
 	}
 
 	b.mu.Lock()
@@ -924,7 +924,7 @@ func (b *Board) doneNow(t *Task) {
 		if dir, err := b.dirFor(t); err != nil {
 			b.note(t, "board", "qa", "No Jira check: "+err.Error())
 		} else {
-			go b.checkJira(t.ID, t.Title, dir, t.Jira)
+			go b.checkJira(b.agentFor("decide", t.Area, ""), t.ID, t.Title, dir, t.Jira)
 		}
 	}
 	pages := taskPulls(t)
@@ -944,10 +944,10 @@ func (b *Board) doneNow(t *Task) {
 	go b.cleanMerged(t.ID, dir, pane, pages)
 }
 
-// checkJira runs once a task is done: an agent run in the task's folder (dir) reads each of its Jira keys live and
+// checkJira runs once a task is done: a run of agent ag in the task's folder (dir) reads each of its Jira keys live and
 // moves one still before QA on, the way the qa action does, noting on task id what it found. It leaves the task's
 // session alone, so a session that closed its own task keeps working.
-func (b *Board) checkJira(id, title, dir string, keys []string) {
+func (b *Board) checkJira(ag Agent, id, title, dir string, keys []string) {
 	prompt := fmt.Sprintf(`The task %[1]q on Eugene's Hirdman board (%[2]s) was just closed as done. Nobody is watching this run.
 
 Its Jira tickets should have moved on with it. Read the status of each in Jira now: %[3]s. One still before QA
@@ -957,7 +957,7 @@ Then record each key's status now:
   curl -s -X PUT %[2]s/api/tasks/%[4]s -H 'Content-Type: application/json' -d '{"jiraStatus": {"<KEY>": "<status now>"}}'
 Your final message goes into the task's history as is: one line per key, its status and whether you moved it.`,
 		title, b.selfURL, strings.Join(keys, ", "), id)
-	status, text := runAgent(b.agent, dir, prompt)
+	status, text := runAgent(ag, dir, prompt)
 	if status != "ok" {
 		text = "Jira check failed: " + text
 	}

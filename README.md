@@ -10,7 +10,7 @@ One Go binary, standard library plus a TOML parser; the whole page is `index.htm
 
 - **Tasks** live in one JSON state file. Each belongs to an *area*: a project folder its sessions run in.
   Every change is also appended to a weekly history log (`log/<monday>.jsonl` next to the state file).
-- **Buttons** (`reply`, `act`, `qa`) start the agent (`HIRDMAN_AGENT`) in that area's folder, in a new wezterm mux tab or window
+- **Buttons** (`reply`, `act`, `qa`) start the session agent (`[use]`) in that area's folder, in a new wezterm mux tab or window
   (or any terminal, see `HIRDMAN_TERMINAL`), with the task as JSON and the rule for that action.
 - **The brief** runs on a schedule per area (`briefEvery`) or from the page: each of the area's `runs`, a prompt the
   agent runs in its folder, or the built-in roadmap run that keeps a task per next item of its roadmap files.
@@ -64,8 +64,28 @@ roadmap = ["planning/roadmap.md"]
 
 An area: `id` (stored on its tasks), `name` (shown), `dir` (where its sessions and runs run), `roadmap` (globs of the
 files the roadmap run reads; unset is `roadmap.md`, `TODO.md` and the like, `[]` none), `runs` (what its brief is:
-each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no brief), `jiraRoom`, `briefEvery`,
-`issueUrl`, `prUrl`.
+each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no brief; a prompt's `agent` overrides the
+area's `use.headless`), `jiraRoom`, `briefEvery`, `issueUrl`, `prUrl`, `use` (the area's own `[use]` picks).
+
+Agents are `[agents.<name>]` entries of `kind = "claude-code"` (Claude Code, the only kind yet) with a `command` (default
+`claude`) and a `model` (its `--model`). `[use]` picks one per job: `session` (the sessions the buttons open: code
+investigation and implementation), `headless` (brief runs) and `decide` (the light headless jobs: Jira triage, a Jira
+update's refresh of its task, the Jira check of a closed task). Built in, and what your own entries add to or override:
+
+```toml
+[agents.haiku]
+kind = "claude-code"
+model = "haiku"
+
+[agents.opus]
+kind = "claude-code"
+model = "opus"
+
+[use]
+session = "opus"
+headless = "opus"
+decide = "haiku"
+```
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -73,7 +93,6 @@ each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no bri
 | | `HIRDMAN_STATE` | `~/.local/state/hirdman/state.json` | State file; logs live next to it (env only) |
 | | `HIRDMAN_CONFIG` | `~/.config/hirdman/config.toml` | This file (env only) |
 | `url` | `HIRDMAN_URL` | `http://localhost` + `HIRDMAN_ADDR` | How sessions reach the board |
-| `agent` | `HIRDMAN_AGENT` | `claude` | The agent command; it takes Claude Code's flags |
 | `terminal` | `HIRDMAN_TERMINAL` | wezterm mux | A terminal command the session is appended to, e.g. `kitty`, `alacritty -e` |
 | `sessionIn` | `HIRDMAN_SESSION_IN` | `tab` | wezterm: a new `tab` in the last used window, or its own `window` |
 | `briefEvery` | `HIRDMAN_BRIEF_EVERY` | off | Default brief interval for areas without `briefEvery` (a Go duration) |
