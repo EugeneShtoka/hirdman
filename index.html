@@ -737,10 +737,10 @@ function setTheme(t) {
 // of choices; "" is the first.
 // The board-wide values below the projects are the defaults a project without its own takes.
 const SETTINGS = [
-  ["Projects", [["HIRDMAN_AREAS", "Projects", "A project's runs, what its brief is, are set in config.toml; one with none set is briefed from its roadmap files.", "projects"]]],
+  ["Projects", [["HIRDMAN_AREAS", "Projects", "A project's runs (what its brief is; with none set, its roadmap files), its issue feeds and its MCP servers are set in config.toml.", "projects"]]],
   ["Briefs", [["HIRDMAN_BRIEF_EVERY", "Brief every", "How often a project without its own is briefed, e.g. 6h; empty is only by the button."]]],
-  ["Watchers", [["HIRDMAN_JIRA_POLL", "Jira feed poll", "Empty is 2m."], ["HIRDMAN_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
-    ["HIRDMAN_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."], ["HIRDMAN_KITH_MCP", "kith MCP command", "Empty is kith-mcp."]]],
+  ["Watchers", [["HIRDMAN_JIRA_POLL", "Issue feed poll", "Empty is 2m."], ["HIRDMAN_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
+    ["HIRDMAN_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."]]],
   ["Sessions", [["HIRDMAN_AGENT", "Agent command", "Empty is claude."], ["HIRDMAN_TERMINAL", "Terminal", "Empty is the wezterm mux, else a command the session is appended to, e.g. kitty."],
     ["HIRDMAN_SESSION_IN", "A wezterm session opens in", "", [["", "A new tab"], ["window", "Its own window"]]],
     ["HIRDMAN_CLEAN_MERGED", "Clean up merged work", "A task done with a merged pull request closes its session and removes its worktree.", "check"]]],
@@ -754,7 +754,6 @@ const SETTINGS = [
 const PROJECT = [["id", "Id", "Stored on its tasks: lowercase, unique, e.g. kith."], ["name", "Name", "Shown on the board; empty is the id."],
   ["dir", "Folder", "Where its sessions run, e.g. ~/dev/kith."],
   ["roadmap", "Roadmap files", "Globs in the folder, comma-separated; empty is roadmap.md, TODO.md and the like; none reads no files."],
-  ["jiraRoom", "Jira feed room", "The kith room its Jira bot posts in; empty watches none."],
   ["briefEvery", "Brief every", "e.g. 6h; empty is the board's below; 0 is only by the button."],
   ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is its folder's GitHub origin, else the board's below."]];
 let projects = [];

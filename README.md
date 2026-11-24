@@ -46,15 +46,26 @@ form edits the file and restarts the board. Each setting's env var, when set, wi
 briefEvery = "6h"
 githubPoll = "1m"
 
+[mcp.kith]
+command = "kith-mcp"
+
+[mcp.atlassian]
+url = "https://mcp.atlassian.com/v2/mcp"
+
 [[areas]]
 id = "work"
 name = "Work"
 dir = "~/dev/work"
-jiraRoom = "slack:T0000/D0000"
+mcp = ["kith", "atlassian"]
 
   [[areas.runs]]
   name = "brief"
   prompt = """Use the brief skill. This is a scheduled run and nobody is watching."""
+
+  [[areas.feeds]]
+  mcp = "kith"
+  tool = "read_room"
+  args = { room = "slack:T0000/D0000", limit = 50 }
 
 [[areas]]
 id = "kith"
@@ -64,8 +75,16 @@ roadmap = ["planning/roadmap.md"]
 
 An area: `id` (stored on its tasks), `name` (shown), `dir` (where its sessions and runs run), `roadmap` (globs of the
 files the roadmap run reads; unset is `roadmap.md`, `TODO.md` and the like, `[]` none), `runs` (what its brief is:
-each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no brief), `jiraRoom`, `briefEvery`,
+each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no brief), `mcp`, `feeds`, `briefEvery`,
 `issueUrl`, `prUrl`.
+
+`[mcp.<name>]` is an MCP server: a stdio `command` (with `args`), or an HTTP `url`. An area's `mcp` lists the servers its
+agents (sessions, Jira updates, triage, its brief runs) get, and only those (`--mcp-config` with `--strict-mcp-config`);
+unset leaves them the folder's own Claude config, `[]` gives none. A run's own `mcp` replaces its area's for that run.
+
+An area's `feeds` are its issue updates: each calls `tool` of a stdio `[mcp]` server with `args`, every `jiraPoll`, and
+takes the answer as `{"messages": [{"event_id", "body"}]}` (kith's `read_room`). The issue keys in each new message
+(`keys`, a pattern; empty is `issueKey`) update the tasks that track them, or are triaged onto the board.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -77,10 +96,9 @@ each a `prompt`, or `builtin = "roadmap"`; unset is the roadmap run, `[]` no bri
 | `terminal` | `HIRDMAN_TERMINAL` | wezterm mux | A terminal command the session is appended to, e.g. `kitty`, `alacritty -e` |
 | `sessionIn` | `HIRDMAN_SESSION_IN` | `tab` | wezterm: a new `tab` in the last used window, or its own `window` |
 | `briefEvery` | `HIRDMAN_BRIEF_EVERY` | off | Default brief interval for areas without `briefEvery` (a Go duration) |
-| `jiraPoll` | `HIRDMAN_JIRA_POLL` | `2m` | How often to read each area's `jiraRoom` |
-| `kithMcp` | `HIRDMAN_KITH_MCP` | `kith-mcp` | The kith MCP server command |
+| `jiraPoll` | `HIRDMAN_JIRA_POLL` | `2m` | How often to read each area's `feeds` |
 | `githubPoll` | `HIRDMAN_GITHUB_POLL` | off | How often to read GitHub notifications |
-| `issueKey` | `HIRDMAN_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the Jira feed and GitHub |
+| `issueKey` | `HIRDMAN_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the issue feeds and GitHub |
 | `issueUrl`, `prUrl` | `HIRDMAN_ISSUE_URL`, `HIRDMAN_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without their own; an area without `prUrl` first takes its folder's GitHub `origin` |
 | `cleanMerged` | `HIRDMAN_CLEAN_MERGED` | off | `"1"`: a task done with a merged pull request closes its session and removes the worktree |
 
