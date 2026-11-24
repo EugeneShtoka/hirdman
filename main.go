@@ -642,6 +642,10 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) { //nolint:
 	if ok && next.Area != t.Area {
 		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "agent"), "area", t.Area+" → "+next.Area)
 	}
+	// A session's findings often land in the story before its report; the brief's daily rewrites stay out of history.
+	if ok && next.Summary != t.Summary && t.Job != nil && t.Job.Status == "running" {
+		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "agent"), "summary", next.Summary)
+	}
 	if _, set := patch["status"]; set && next.Status != prevStatus {
 		setStatus(&next, next.Status)
 		if ok {
@@ -1256,7 +1260,7 @@ func (b *Board) spawnSession(dir, id, name string, args ...string) (string, erro
 	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{
 		"PreToolUse": []any{map[string]any{
 			"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": post("ask"), "timeout": 86400}}}},
-		"StopFailure": onSession, "SessionEnd": onSession}})
+		"Stop": onSession, "StopFailure": onSession, "SessionEnd": onSession}})
 	if err != nil {
 		return "", fmt.Errorf("spawn: %w", err)
 	}
@@ -1437,9 +1441,10 @@ func (b *Board) resume(t *Task) bool {
 	return true
 }
 
-// handleSessionHook takes a session's StopFailure and SessionEnd hooks (see spawnSession). A turn stopped by a passing
-// API error is continued after a backoff, up to maxRetries times a job; any other is noted for Eugene. Eugene exiting
-// the session ends its job, so it isn't resumed.
+// handleSessionHook takes a session's Stop, StopFailure and SessionEnd hooks (see spawnSession). A turn that ends before
+// the report goes into the history as the agent's message, as the board sees nothing else of its terminal. A turn stopped
+// by a passing API error is continued after a backoff, up to maxRetries times a job; any other is noted for Eugene.
+// Eugene exiting the session ends its job, so it isn't resumed.
 func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
 	var hook struct {
 		Event  string `json:"hook_event_name"`
@@ -1461,6 +1466,8 @@ func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
 	}
 	j := t.Job
 	switch {
+	case hook.Event == "Stop" && hook.Last != "":
+		b.note(t, "agent", "message", hook.Last)
 	case hook.Event == "SessionEnd" && (hook.Reason == "prompt_input_exit" || hook.Reason == "logout"):
 		now := time.Now()
 		j.Status, j.EndedAt = "stopped", &now
