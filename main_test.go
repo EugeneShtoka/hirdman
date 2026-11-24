@@ -292,6 +292,31 @@ func TestHandleUpsertLevels(t *testing.T) {
 	}
 }
 
+func TestUpsertSummaryHistory(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"t1": {ID: "t1", Area: "work", Summary: "old", Job: &Job{Action: "act", Status: "running"}},
+		"t2": {ID: "t2", Area: "work", Summary: "old"},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
+	for _, id := range []string{"t1", "t2"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "PUT", "/api/tasks/"+id, strings.NewReader(`{"summary": "found it"}`)))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d", id, rec.Code)
+		}
+	}
+	// A running session's story change goes into the history; the brief rewriting an idle task's does not.
+	if h := b.st.Tasks["t1"].History; len(h) != 1 || h[0].Kind != "summary" || h[0].Text != "found it" {
+		t.Errorf("t1 history %+v, want one summary entry", h)
+	}
+	if h := b.st.Tasks["t2"].History; len(h) != 0 {
+		t.Errorf("t2 history %+v, want none", h)
+	}
+}
+
 func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
@@ -310,7 +335,7 @@ func TestSpawnSessionTerminal(t *testing.T) {
 	// Its questions, API errors and exits go to the board: the hooks post them to the task, its id escaped out of the shell quotes.
 	session := `[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/session' -H 'Content-Type: application/json' --data-binary @-","type":"command"}]}]`
 	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}],` +
-		`"SessionEnd":` + session + `,"StopFailure":` + session + `}}`
+		`"SessionEnd":` + session + `,"Stop":` + session + `,"StopFailure":` + session + `}}`
 	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\n--session-id\nu1\ndo it\n"
 	if string(out) != want {
 		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
@@ -589,6 +614,11 @@ func TestSessionHook(t *testing.T) {
 		return h[len(h)-1].Text
 	}
 
+	// A turn that ends before the report shows on the board.
+	hook("t1", `{"hook_event_name":"Stop","last_assistant_message":"Which branch should I use?"}`)
+	if got := last("t1"); got != "Which branch should I use?" {
+		t.Errorf("a stopped turn noted %q", got)
+	}
 	// A passing API error is continued, maxRetries times.
 	for i := range maxRetries {
 		hook("t1", `{"hook_event_name":"StopFailure","error":"overloaded","last_assistant_message":"API Error: 529"}`)
@@ -620,6 +650,12 @@ func TestSessionHook(t *testing.T) {
 	hook("t2", `{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}`)
 	if got := b.st.Tasks["t2"].Job.Status; got != "stopped" {
 		t.Errorf("after /exit, job %q, want stopped", got)
+	}
+	// Once the job is over, the session's turns stay in its terminal.
+	n := len(b.st.Tasks["t2"].History)
+	hook("t2", `{"hook_event_name":"Stop","last_assistant_message":"Bye"}`)
+	if len(b.st.Tasks["t2"].History) != n {
+		t.Error("a turn after the job ended was noted")
 	}
 	if strings.Contains(calls(), "pane-id 8") {
 		t.Error("typed into t2's pane")

@@ -401,7 +401,7 @@ function renderDialog(fresh) {
       <label id="f-resume-row" style="display:flex;gap:0.5rem;align-items:center" hidden><input type="checkbox" id="f-resume" checked>Resume the task's agent session (unchecked: start a new one)</label>
       <div class="btns" id="d-btns"></div>
       <div class="tagrow" id="d-comb" hidden><label for="f-comb">Combine with<select id="f-comb"></select></label><button type="button" class="btn" id="f-comb-go">Combine</button></div>
-      <div class="hint">Reply sends right away. Send opens an agent session on this task (wezterm, or claude.ai/code), and the task keeps it: Send again goes on in it, resumed if it closed, and while the agent works it adds the guidance to it. Its questions show here to answer, its report lands in the history; Close, Drop and Delete stop it. Combine (or dropping a card on another) keeps the older task and moves the newer one's history, story and files into it.</div>
+      <div class="hint">Reply sends right away. Send opens an agent session on this task (wezterm, or claude.ai/code), and the task keeps it: Send again goes on in it, resumed if it closed, and while the agent works it adds the guidance to it. Its questions show here to answer; its story changes, what it says when it stops and its report land in the history; Close, Drop and Delete stop it. Combine (or dropping a card on another) keeps the older task and moves the newer one's history, story and files into it.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
   // Send while the agent works types the guidance into its session, which only a wezterm pane can take.
