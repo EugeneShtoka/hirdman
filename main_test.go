@@ -578,6 +578,43 @@ func TestCloseChecksJira(t *testing.T) {
 	}
 }
 
+// A task Eugene adds gets a look-only agent run in its folder, whose findings go into its history; one the brief adds does not.
+func TestCreatePreps(t *testing.T) {
+	dir := t.TempDir()
+	fake := "#!/bin/sh\npwd >> " + dir + "/ran; printf '%s' \"$2\" > " + dir + "/prompt\necho '{\"type\":\"result\",\"result\":\"main.go:1 is it\"}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "agent"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, agent: filepath.Join(dir, "agent"), areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{}
+	mux := b.routes()
+	for _, path := range []string{"/api/tasks/brief", "/api/tasks/mine?actor=eugene"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPut, path, strings.NewReader(`{"area":"work","title":"Look into X"}`)))
+		if rec.Code != 200 {
+			t.Fatalf("create %s: %d", path, rec.Code)
+		}
+	}
+	last := func() Entry {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		h := b.st.Tasks["mine"].History
+		return h[len(h)-1]
+	}
+	for i := 0; i < 100 && last().Kind != "prep"; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if e := last(); e.Actor != "agent" || e.Kind != "prep" || e.Text != "main.go:1 is it" {
+		t.Errorf("last entry = %+v, want the agent's findings", e)
+	}
+	if ran, _ := os.ReadFile(filepath.Join(dir, "ran")); strings.TrimSpace(string(ran)) != dir {
+		t.Errorf("agent ran %q, want once, in the area's folder %q", ran, dir)
+	}
+	if prompt, _ := os.ReadFile(filepath.Join(dir, "prompt")); !strings.Contains(string(prompt), `"title":"Look into X"`) {
+		t.Errorf("prompt %q doesn't carry the task", prompt)
+	}
+}
+
 func TestSessionHook(t *testing.T) {
 	dir := t.TempDir()
 	// A fake wezterm: pane 7 is t1's session; every other call is logged.
