@@ -969,9 +969,36 @@ Your final message goes into the task's history as is: one line per key, its sta
 	}
 }
 
-// prep runs once Eugene adds task t: a read-only agent run in its folder gathers what deciding on it needs, and its
-// findings go into t's history, where t's sessions read them. The caller holds mu.
-func (b *Board) prep(t *Task) {
+// prep runs once a task is added, whoever adds it: a look-only agent run in its folder checks the story's facts and
+// gathers what deciding on it needs, and its findings go into the task's history, where the task's sessions read them.
+// One runs at a time, as a brief can add many tasks at once.
+func (b *Board) prep(id string) {
+	b.prepping.Lock()
+	defer b.prepping.Unlock()
+	dir, prompt := b.prepPrompt(id)
+	if prompt == "" {
+		return
+	}
+	status, text := runAgent(b.agent, dir, prompt)
+	if status != "ok" {
+		text = "Preprocessing failed: " + text
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t := b.st.Tasks[id]; t != nil {
+		b.note(t, "agent", "prep", text)
+		b.saveOrLog()
+	}
+}
+
+// prepPrompt is prep's folder and prompt for task id; no prompt for a task closed or gone before its turn.
+func (b *Board) prepPrompt(id string) (dir, prompt string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.st.Tasks[id]
+	if t == nil || t.Status == "done" || t.Status == "dropped" {
+		return "", ""
+	}
 	dir, err := b.dirFor(t)
 	var task []byte
 	if err == nil {
@@ -979,32 +1006,23 @@ func (b *Board) prep(t *Task) {
 	}
 	if err != nil {
 		b.note(t, "board", "prep", "No preprocessing: "+err.Error())
-		return
+		b.saveOrLog()
+		return "", ""
 	}
-	prompt := fmt.Sprintf(`Eugene just added a task to his Hirdman board (%s). Nobody is watching this run.
+	return dir, fmt.Sprintf(`A task was just added to Eugene's Hirdman board (%s); its source says by whom ("" is the brief). Nobody is
+watching this run.
 
 Task:
 %s
 
-Before he gets to it, do the first investigation, so deciding what to do is quick: find what the task touches
-(code, config, docs, git history, open pull requests; Jira tickets and chat when it names or implies them; public
-docs when it is about an outside API or tool), what is already there or already tried, the likely approaches and their
-size, and what is unclear and who could answer it. Look only: change no file, run nothing that writes, send no message,
-change nothing in Jira or on the board.
+Before Eugene gets to it, do the first investigation, so deciding how to proceed is quick. Check the facts its story
+states against their sources, and find what it touches: code, config, docs, git history, open pull requests; Jira
+tickets and chat (kith) when it names or implies them; logs and databases this folder's tools and CLAUDE.md reach, with
+read-only queries; public docs when it is about an outside API or tool. Then what is already there or already tried,
+the likely approaches and their size, and what is unclear and who could answer it. Look only: change no file, write to
+no database, send no message, change nothing in Jira or on the board.
 Your final message goes into the task's history as is: the facts, with file:line, keys and links, then the open
 questions, in at most 15 short lines.`, b.selfURL, task)
-	go func(id string) {
-		status, text := runAgent(b.agent, dir, prompt)
-		if status != "ok" {
-			text = "Preprocessing failed: " + text
-		}
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		if now := b.st.Tasks[id]; now != nil {
-			b.note(now, "agent", "prep", text)
-			b.saveOrLog()
-		}
-	}(t.ID)
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the

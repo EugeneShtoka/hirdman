@@ -152,6 +152,7 @@ type Board struct {
 	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
 	triage   chan struct{}     // one Jira triage at a time
+	prepping sync.Mutex        // one task preprocessing at a time, see prep
 	wake     chan struct{}     // nudges scheduleBrief out of its sleep
 	rerun    map[string]bool   // area ids to brief now: the board's button, or a brief that ran while kith was down
 	ghETag   string            // pollGitHub's own: the ETag of its last notifications answer
@@ -638,8 +639,9 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) { //nolint:
 	}
 	if !ok && r.URL.Query().Get("actor") == "eugene" {
 		b.note(&next, "eugene", "created", "Added on the board.")
-		// The brief, sweep and triage write a researched story; Eugene's own task starts as a line, so it gets one.
-		b.prep(&next)
+	}
+	if !ok {
+		go b.prep(id)
 	}
 	if ok && next.Area != t.Area {
 		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "agent"), "area", t.Area+" → "+next.Area)
