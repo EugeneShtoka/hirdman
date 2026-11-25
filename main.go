@@ -1316,7 +1316,9 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	fmt.Fprintf(&sb, "\nWhat to do: %s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\",\"waitingFor\":\"PR review\"}'   # todo|doing|waiting|done|dropped; waitingFor: what who owes; start it with \"PR review\" when that is all, and the merge closes the task\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"triggers\":[{\"on\":\"main\",\"do\":\"...\"}]}'   # work left for after the merge: a session starts on the task to do it once a pull request it links reaches that branch (or \"at\": an RFC 3339 time, or \"jiraStatus\"); this replaces task.triggers, so keep the ones it has\n"+
-		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n",
+		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n"+
+		"Keep every field true as the work moves on: status, who, waitingFor (clear it once answered), jiraStatus. The title is a short name of the thing\n"+
+		"(\"TMDV-1870 All Matches sort by time\"): who owes what, since when, answered or not go in those fields; shorten a title that carries them.\n",
 		actionRules[req.Action], b.selfURL, t.ID)
 	if req.Action == "update" {
 		sb.WriteString("Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n")
