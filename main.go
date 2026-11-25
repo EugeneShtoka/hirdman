@@ -173,7 +173,7 @@ type Board struct {
 	env      map[string]string // the service's env, before config.toml; a setting it has wins over the file
 	restart  chan struct{}     // a saved setting: main restarts the board to apply it
 
-	asks map[string]chan []byte // task id -> its session's waiting question, which takes the hook's reply
+	asks map[string]chan map[string]string // task id -> its session's waiting question, which takes Eugene's answers
 }
 
 // areaRe keeps an area id a plain lowercase name.
@@ -232,9 +232,10 @@ type MCPServer struct {
 	URL     string   `toml:"url,omitempty"`
 }
 
-// mcpFlags are the agent's flags that give it exactly the [mcp] servers names lists; nil is none, the folder's own config.
-func (b *Board) mcpFlags(names []string) []string {
-	if names == nil {
+// mcpFlags are the agent's flags that give it exactly the [mcp] servers names lists, nil being the folder's own config,
+// and to a session the board's own server too (handleMCP), as hirdman.
+func (b *Board) mcpFlags(names []string, session bool) []string {
+	if names == nil && !session {
 		return nil
 	}
 	type server struct {
@@ -251,18 +252,25 @@ func (b *Board) mcpFlags(names []string) []string {
 			servers[n] = server{Type: "stdio", Command: s.Command, Args: s.Args}
 		}
 	}
+	if session {
+		servers["hirdman"] = server{Type: "http", URL: b.selfURL + "/mcp"}
+	}
 	data, _ := json.Marshal(struct { //nolint:errchkjson // strings only
 		Servers map[string]server `json:"mcpServers"`
 	}{servers})
+	if names == nil {
+		return []string{"--mcp-config", string(data)}
+	}
 	return []string{"--strict-mcp-config", "--mcp-config", string(data)}
 }
 
 // mcpFor is mcpFlags for the area id's servers.
-func (b *Board) mcpFor(area string) []string {
+func (b *Board) mcpFor(area string, session bool) []string {
+	var names []string
 	if i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == area }); i >= 0 {
-		return b.mcpFlags(b.areas[i].MCP)
+		names = b.areas[i].MCP
 	}
-	return nil
+	return b.mcpFlags(names, session)
 }
 
 // Agent is one [agents.<name>]: kind "claude-code", the only kind yet, is Claude Code, run as Command (empty is claude) on
@@ -1069,29 +1077,21 @@ func union[T any](a, c []T, eq func(x, y T) bool) []T {
 	return a
 }
 
-// handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
-// holds until Eugene answers there (handleAnswer), its reply answering the tool. An empty reply hands the question to
-// the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
-func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
-	var hook struct {
-		ToolInput json.RawMessage `json:"tool_input"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil || len(hook.ToolInput) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "need a PreToolUse hook's input"})
-		return
-	}
-	id, ch := r.PathValue("id"), make(chan []byte, 1)
+// ask puts question, an AskUserQuestion input, on task id while its session waits for Eugene to answer it on the board
+// (handleAnswer), and returns his answers, none when he hands it back to the session's terminal; !ok when the task has
+// no session, a question already waits on it, or done closes first (a timeout, a board restart).
+func (b *Board) ask(done <-chan struct{}, id string, question json.RawMessage) (answers map[string]string, ok bool) {
+	ch := make(chan map[string]string, 1)
 	b.mu.Lock()
-	t, ok := b.st.Tasks[id]
-	if !ok || t.Job == nil || b.asks[id] != nil {
+	t, found := b.st.Tasks[id]
+	if !found || t.Job == nil || b.asks[id] != nil {
 		b.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-		return
+		return nil, false
 	}
 	if b.asks == nil {
-		b.asks = map[string]chan []byte{}
+		b.asks = map[string]chan map[string]string{}
 	}
-	b.asks[id], t.Job.Question = ch, hook.ToolInput
+	b.asks[id], t.Job.Question = ch, question
 	b.saveOrLog()
 	b.mu.Unlock()
 	defer func() {
@@ -1107,13 +1107,48 @@ func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
 		b.saveOrLog()
 	}()
 	select {
-	case out := <-ch:
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(out); err != nil {
-			log.Printf("ask: %v", err)
-		}
-	case <-r.Context().Done():
+	case answers = <-ch:
+		return answers, true
+	case <-done:
+		return nil, false
 	}
+}
+
+// handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
+// holds until Eugene answers there (see ask), its reply answering the tool. An empty reply hands the question to
+// the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
+func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
+	var hook struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	var input map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil || json.Unmarshal(hook.ToolInput, &input) != nil || input == nil {
+		writeJSON(w, 400, map[string]string{"error": "need a PreToolUse hook's input"})
+		return
+	}
+	answers, _ := b.ask(r.Context().Done(), r.PathValue("id"), hook.ToolInput)
+	if len(answers) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	input["answers"] = answers
+	writeJSON(w, 200, map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": input}})
+}
+
+// answerText is answers to question, an AskUserQuestion input, a line each: "question → answer".
+func answerText(question json.RawMessage, answers map[string]string) string {
+	var asked struct {
+		Questions []struct {
+			Question string `json:"question"`
+		} `json:"questions"`
+	}
+	_ = json.Unmarshal(question, &asked) // ask's callers took only an object
+	lines := make([]string, 0, len(asked.Questions))
+	for _, q := range asked.Questions {
+		lines = append(lines, q.Question+" → "+answers[q.Question])
+	}
+	return strings.Join(lines, "\n")
 }
 
 // handleAnswer answers the question a task's session waits on: {"answers": {question: answer}}, an answer being an
@@ -1136,35 +1171,11 @@ func (b *Board) handleAnswer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]string{"error": "no question is waiting on this task"})
 		return
 	}
-	var out []byte
 	text := "Answer it in the session's terminal."
 	if len(req.Answers) > 0 {
-		var input map[string]any
-		var asked struct {
-			Questions []struct {
-				Question string `json:"question"`
-			} `json:"questions"`
-		}
-		if err := json.Unmarshal(t.Job.Question, &input); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		_ = json.Unmarshal(t.Job.Question, &asked) // it parsed as input just above
-		input["answers"] = req.Answers
-		var err error
-		out, err = json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
-			"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": input}})
-		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		lines := make([]string, 0, len(asked.Questions))
-		for _, q := range asked.Questions {
-			lines = append(lines, q.Question+" → "+req.Answers[q.Question])
-		}
-		text = strings.Join(lines, "\n")
+		text = answerText(t.Job.Question, req.Answers)
 	}
-	ch <- out
+	ch <- req.Answers
 	delete(b.asks, id)
 	t.Job.Question = nil
 	b.note(t, "eugene", "answer", text)
@@ -1410,7 +1421,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 			"When the action is done, post your report once, 2-4 plain lines saying what you did, what was sent or drafted, and links; "+
 			"it goes into the task's history and marks the job finished:\n"+
 			"  jq -n --arg text '...' '{actor: \"agent\", kind: \"%[3]s\", text: $text}' | curl -s -X POST %[1]s/api/tasks/%[2]s/notes -H 'Content-Type: application/json' -d @-\n"+
-			"Then stay open for Eugene.\n", b.selfURL, t.ID, req.Action)
+			"Then stay open for Eugene. To ask him something, use the hirdman MCP server's ask_board tool with task %[2]q: he answers on the task's card.\n", b.selfURL, t.ID, req.Action)
 	}
 	return sb.String(), nil
 }
@@ -1431,7 +1442,7 @@ func (b *Board) start(t *Task, req actRequest) {
 	if err == nil && req.Action == "update" {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			go b.run(b.agentFor("headless", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
+			go b.run(b.agentFor("headless", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area, false))
 			return
 		}
 	}
@@ -1452,7 +1463,7 @@ func (b *Board) start(t *Task, req actRequest) {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
 			t.Job.Pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, t.Job.Session,
-				slices.Concat(b.mcpFor(t.Area), []string{idFlag, t.Job.SessionID, prompt})...)
+				slices.Concat(b.mcpFor(t.Area, true), []string{idFlag, t.Job.SessionID, prompt})...)
 		}
 	}
 	if err != nil {
@@ -1715,7 +1726,7 @@ func (b *Board) resume(t *Task) bool {
 	pane := ""
 	if err == nil {
 		pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, j.Session,
-			slices.Concat(b.mcpFor(t.Area), []string{"--resume", j.SessionID, resumePrompt})...)
+			slices.Concat(b.mcpFor(t.Area, true), []string{"--resume", j.SessionID, resumePrompt})...)
 	}
 	if err != nil {
 		b.note(t, "agent", "session", fmt.Sprintf("Could not resume session %q: %v", j.Session, err))
@@ -1785,7 +1796,8 @@ const mcpInstructions = "Hirdman is Eugene's task board. A conversation it start
 	"which names the task and its id and asks for one report. Once that report is posted the board sees nothing more of the " +
 	"conversation, whether it goes on in the board's pane or was resumed elsewhere (claude --resume, claude.ai). So from then on, " +
 	"end every turn that did more work on the task with note_task: 1-3 plain lines on what changed; and call update_task when " +
-	"its status, waitingFor or story changed. In a conversation the board did not start on a task, leave these tools alone."
+	"its status, waitingFor or story changed. To ask Eugene something on the task, use ask_board: he answers on the board. " +
+	"In a conversation the board did not start on a task, leave these tools alone."
 
 var mcpTools = func() []map[string]any {
 	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
@@ -1799,11 +1811,83 @@ var mcpTools = func() []map[string]any {
 		tool("update_task", "Merge fields into a Hirdman task: status (todo|doing|waiting|done|dropped), waitingFor, summary, "+
 			"triggers (replaces the task's), as the board's PUT /api/tasks/{id} does.",
 			map[string]any{"task": str("the task's id"), "fields": map[string]any{"type": "object"}}),
+		{"name": "ask_board", "description": "Ask Eugene on a Hirdman task's card, as AskUserQuestion asks in the terminal, while " +
+			"the board's session on it runs: the call waits until he answers there, hours maybe, and returns his answers, or says to ask in the terminal.",
+			"inputSchema": map[string]any{"type": "object", "required": []string{"task", "questions"}, "properties": map[string]any{
+				"task": str("the task's id"),
+				"questions": map[string]any{"type": "array", "minItems": 1, "maxItems": 4, "items": map[string]any{
+					"type": "object", "required": []string{"question", "header", "options"}, "properties": map[string]any{
+						"question":    str("the whole question"),
+						"header":      str("a label of at most 12 characters"),
+						"multiSelect": map[string]any{"type": "boolean"},
+						"options": map[string]any{"type": "array", "minItems": 2, "maxItems": 4, "items": map[string]any{
+							"type": "object", "required": []string{"label"},
+							"properties": map[string]any{"label": str("1-5 words"), "description": str("what picking it means")}}},
+					}}}}}},
 	}
 }()
 
-// handleMCP serves the board as an MCP server (streamable HTTP, JSON replies only), so a session the board started can
-// still report to its task once it has left the board's hooks behind. Register it at user scope:
+// progressEvery is how often ask_board tells a client that asked for progress that it still waits, so the client
+// doesn't drop a call silent for too long (Claude Code's is 5 minutes).
+var progressEvery = 30 * time.Second
+
+// callAsk answers an ask_board call (id) on task: Eugene's answers, a line each, or where to ask instead. A call with a
+// progress token gets an event stream: a progress notification every progressEvery while it waits, then the result.
+func (b *Board) callAsk(w http.ResponseWriter, r *http.Request, id json.RawMessage, task string, questions json.RawMessage, token any) {
+	type asked struct {
+		Question string            `json:"question"`
+		Options  []json.RawMessage `json:"options"`
+	}
+	var qs []asked
+	result := make(chan string, 1)
+	question, err := json.Marshal(map[string]json.RawMessage{"questions": questions})
+	if err != nil || json.Unmarshal(questions, &qs) != nil || len(qs) == 0 ||
+		slices.ContainsFunc(qs, func(q asked) bool { return q.Question == "" || len(q.Options) == 0 }) {
+		result <- "Give ask_board one or more questions, each with its options."
+	} else {
+		go func() {
+			answers, ok := b.ask(r.Context().Done(), task, question)
+			switch {
+			case !ok:
+				result <- "The board can't take this question now (no session of its own on " + task + ", or another question waits): ask in your terminal."
+			case len(answers) == 0:
+				result <- "Eugene handed this question back: ask it in your terminal."
+			default:
+				result <- answerText(question, answers)
+			}
+		}()
+	}
+	reply := func(text string) map[string]any {
+		return map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"isError": false, "content": []any{map[string]any{"type": "text", "text": text}}}}
+	}
+	if token == nil {
+		writeJSON(w, 200, reply(<-result))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	send := func(v any) {
+		data, _ := json.Marshal(v) //nolint:errchkjson // plain maps
+		if _, err := fmt.Fprintf(w, "event: message\ndata: %s\n\n", data); err == nil {
+			_ = http.NewResponseController(w).Flush()
+		}
+	}
+	tick := time.NewTicker(progressEvery)
+	defer tick.Stop()
+	for n := 1; ; n++ {
+		select {
+		case text := <-result:
+			send(reply(text))
+			return
+		case <-tick.C:
+			send(map[string]any{"jsonrpc": "2.0", "method": "notifications/progress", "params": map[string]any{
+				"progressToken": token, "progress": n, "message": "waiting for Eugene to answer on the board"}})
+		}
+	}
+}
+
+// handleMCP serves the board as an MCP server (streamable HTTP), so a session the board started can still report to its
+// task once it has left the board's hooks behind, and any agent can ask Eugene on the board. Sessions get it with their
+// MCP servers (see mcpFlags); for the others, register it at user scope:
 // claude mcp add -s user -t http hirdman <HIRDMAN_URL>/mcp
 func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -1813,10 +1897,14 @@ func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 			ProtocolVersion string `json:"protocolVersion"`
 			Name            string `json:"name"`
 			Arguments       struct {
-				Task   string          `json:"task"`
-				Text   string          `json:"text"`
-				Fields json.RawMessage `json:"fields"`
+				Task      string          `json:"task"`
+				Text      string          `json:"text"`
+				Fields    json.RawMessage `json:"fields"`
+				Questions json.RawMessage `json:"questions"`
 			} `json:"arguments"`
+			Meta struct {
+				ProgressToken any `json:"progressToken"`
+			} `json:"_meta"`
 		} `json:"params"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1837,6 +1925,10 @@ func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		reply["result"] = map[string]any{"tools": mcpTools}
 	case "tools/call":
+		if p.Name == "ask_board" {
+			b.callAsk(w, r, req.ID, p.Arguments.Task, p.Arguments.Questions, p.Meta.ProgressToken)
+			return
+		}
 		text, failed := b.callTool(r.Context(), p.Name, p.Arguments.Task, p.Arguments.Text, p.Arguments.Fields)
 		reply["result"] = map[string]any{"isError": failed, "content": []any{map[string]any{"type": "text", "text": text}}}
 	default:

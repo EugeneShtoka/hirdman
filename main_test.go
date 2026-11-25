@@ -1505,15 +1505,23 @@ func TestCheckMCP(t *testing.T) {
 
 	// An area gets exactly its servers; none listed is the folder's own config, [] is no server at all.
 	b.conf, b.areas = ok, ok.Areas
-	if f := b.mcpFor("work"); len(f) != 3 || f[0] != "--strict-mcp-config" || f[1] != "--mcp-config" ||
+	if f := b.mcpFor("work", false); len(f) != 3 || f[0] != "--strict-mcp-config" || f[1] != "--mcp-config" ||
 		f[2] != `{"mcpServers":{"atlassian":{"type":"http","url":"https://mcp.example/mcp"},"kith":{"type":"stdio","command":"kith-mcp"}}}` {
 		t.Errorf("mcpFor(work) = %q", f)
 	}
-	if f := b.mcpFlags([]string{}); len(f) != 3 || f[2] != `{"mcpServers":{}}` {
+	if f := b.mcpFlags([]string{}, false); len(f) != 3 || f[2] != `{"mcpServers":{}}` {
 		t.Errorf("mcpFlags([]) = %q, want strict with no servers", f)
 	}
-	if f := b.mcpFor("none"); f != nil {
+	if f := b.mcpFor("none", false); f != nil {
 		t.Errorf("mcpFor(none) = %q, want no flags", f)
+	}
+	// A session gets the board's own server on top: alone, and not strict, beside the folder's own config.
+	b.selfURL = "http://board"
+	if f := b.mcpFor("none", true); len(f) != 2 || f[0] != "--mcp-config" || f[1] != `{"mcpServers":{"hirdman":{"type":"http","url":"http://board/mcp"}}}` {
+		t.Errorf("mcpFor(none, session) = %q", f)
+	}
+	if f := b.mcpFlags([]string{}, true); len(f) != 3 || f[0] != "--strict-mcp-config" || f[2] != `{"mcpServers":{"hirdman":{"type":"http","url":"http://board/mcp"}}}` {
+		t.Errorf("mcpFlags([], session) = %q", f)
 	}
 }
 
@@ -1775,6 +1783,65 @@ func TestCheckDecisions(t *testing.T) {
 		if _, err := b.checkConfig(&Config{Decisions: bad}); err == nil {
 			t.Errorf("checkConfig(%v) took it", bad)
 		}
+	}
+}
+
+func TestAskBoard(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{"t1": {ID: "t1", Job: &Job{Action: "act", Status: "running"}}, "t2": {ID: "t2"}}
+	srv := httptest.NewServer(b.routes())
+	defer srv.Close()
+	progressEvery = 5 * time.Millisecond
+	questions := `[{"question":"Color?","header":"Color","options":[{"label":"Red"},{"label":"Blue"}]}]`
+	call := func(task, questions, meta string) string {
+		resp, err := http.Post(srv.URL+"/mcp", "application/json", strings.NewReader( //nolint:noctx // a test's
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_board","arguments":{"task":"`+task+`","questions":`+questions+`}`+meta+`}}`))
+		if err != nil {
+			t.Error(err)
+			return ""
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return string(out)
+	}
+	// It waits on the task's card until Eugene answers there, and returns his answers.
+	answer := func(body string) {
+		for range 200 {
+			b.mu.Lock()
+			waiting := b.asks["t1"] != nil
+			b.mu.Unlock()
+			if waiting {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(30 * time.Millisecond) // a few progress ticks
+		if string(b.st.Tasks["t1"].Job.Question) != `{"questions":`+questions+`}` {
+			t.Errorf("question on the card = %s", b.st.Tasks["t1"].Job.Question)
+		}
+		resp, err := http.Post(srv.URL+"/api/tasks/t1/answer", "application/json", strings.NewReader(body)) //nolint:noctx // a test's
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Errorf("answer: %v %v", resp, err)
+		}
+		_ = resp.Body.Close()
+	}
+	go answer(`{"answers":{"Color?":"Blue"}}`)
+	if out := call("t1", questions, ""); !strings.Contains(out, `"text":"Color? → Blue"`) || !strings.HasPrefix(out, `{"id":3`) {
+		t.Errorf("ask_board = %s, want the answer as JSON", out)
+	}
+	// A call that asks for progress gets it while it waits, then its result, as events.
+	go answer(`{}`)
+	out := call("t1", questions, `,"_meta":{"progressToken":"p1"}`)
+	if !strings.HasPrefix(out, "event: message\ndata: {") || !strings.Contains(out, `"method":"notifications/progress","params":{"message":"waiting for Eugene to answer on the board","progress":1,"progressToken":"p1"}`) ||
+		!strings.Contains(out, "handed this question back") {
+		t.Errorf("ask_board with progress = %s", out)
+	}
+	if out := call("t2", questions, ""); !strings.Contains(out, "no session of its own on t2") {
+		t.Errorf("ask_board on a task with no session = %s", out)
+	}
+	if out := call("t1", `[{"question":"Color?"}]`, ""); !strings.Contains(out, "each with its options") || b.asks["t1"] != nil {
+		t.Errorf("ask_board without options = %s", out)
 	}
 }
 
