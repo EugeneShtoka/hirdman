@@ -20,7 +20,8 @@
 // sessionIn (HIRDMAN_SESSION_IN: tab | window: a wezterm session's new tab in the window last used, or its own window),
 // issueUrl / prUrl (HIRDMAN_ISSUE_URL / HIRDMAN_PR_URL: link bases for issue keys and #PR numbers in the page, for areas
 // without their own), cleanMerged (HIRDMAN_CLEAN_MERGED: "1": a task moving to done with a merged pull request closes its
-// session and removes the pull request's worktree, see cleanMerged).
+// session and removes the pull request's worktree, see cleanMerged), jiraUpdates (HIRDMAN_JIRA_UPDATES: "1": a session
+// working on a task moves its Jira keys as the work goes, see jiraRule).
 // Env only: HIRDMAN_ADDR (:8787), HIRDMAN_STATE (~/.local/state/hirdman/state.json).
 // The page's settings form edits config.toml, see handleSaveSettings.
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
@@ -164,6 +165,7 @@ type Board struct {
 	ghOwn    string            // pollOwn's own: the ETag of its last events answer
 	ghLogin  string            // the gh user, read once by pollOwn
 	clean    bool              // HIRDMAN_CLEAN_MERGED
+	jira     bool              // HIRDMAN_JIRA_UPDATES
 	areas    []Area            // config.toml's, parsed
 	conf     Config            // config.toml as read, which the settings page edits
 	confPath string            // HIRDMAN_CONFIG
@@ -1268,6 +1270,23 @@ task's Jira keys reached its status, or its time came. Do what the trigger says:
 given ahead. ` + actRule,
 }
 
+// jiraRule is added to act's and a trigger's rules when HIRDMAN_JIRA_UPDATES is on and the task has Jira keys. Who
+// takes over a ticket's other part (e.g. the frontend) is the folder's own knowledge, not the board's.
+const jiraRule = `Jira updates are on: keep the task's Jira keys (task.jira) in step with the work, reading each key's
+transitions first. When you start work on a key that is before In Progress, move it to In Progress. It moves on only once
+the work is on staging, never when a pull request opens: if that happens while you are here, move it then, else leave a
+trigger on the branch staging deploys from to do it. On staging a key goes to "QA - Staging" (a sub-task with no QA state
+to Done), unless another part of it is still to be built elsewhere (the frontend): then hand it over the way the
+folder's CLAUDE.md or memory says. Record each move: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.`
+
+// rule is what action asks of a session on t.
+func (b *Board) rule(t *Task, action string) string {
+	if b.jira && len(t.Jira) > 0 && (action == "act" || action == "trigger") {
+		return actionRules[action] + "\n" + jiraRule
+	}
+	return actionRules[action]
+}
+
 func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	view := *t
 	view.Job = nil
@@ -1294,7 +1313,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 			fmt.Fprintf(&sb, "The task's attached files: %s\n", strings.Join(t.Files, ", "))
 		}
 		if !slices.Contains(t.Job.Rules, req.Action) {
-			fmt.Fprintf(&sb, "\nWhat to do: %s\n\n", actionRules[req.Action])
+			fmt.Fprintf(&sb, "\nWhat to do: %s\n\n", b.rule(t, req.Action))
 		}
 		fmt.Fprintf(&sb, "When it is done, post your report as before, with kind %q.\n", req.Action)
 		return sb.String(), nil
@@ -1319,7 +1338,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n"+
 		"Keep every field true as the work moves on: status, who, waitingFor (clear it once answered), jiraStatus. The title is a short name of the thing\n"+
 		"(\"TMDV-1870 All Matches sort by time\"): who owes what, since when, answered or not go in those fields; shorten a title that carries them.\n",
-		actionRules[req.Action], b.selfURL, t.ID)
+		b.rule(t, req.Action), b.selfURL, t.ID)
 	if req.Action == "update" {
 		sb.WriteString("Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n")
 	} else {
@@ -1928,6 +1947,7 @@ func main() { //nolint:funlen // one setup step after another
 		terminal: strings.Fields(os.Getenv("HIRDMAN_TERMINAL")),
 		window:   os.Getenv("HIRDMAN_SESSION_IN") == "window",
 		clean:    os.Getenv("HIRDMAN_CLEAN_MERGED") == "1",
+		jira:     os.Getenv("HIRDMAN_JIRA_UPDATES") == "1",
 		selfURL:  env("HIRDMAN_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
@@ -2028,6 +2048,7 @@ type Config struct {
 	Terminal    string               `toml:"terminal,omitempty"`
 	SessionIn   string               `toml:"sessionIn,omitempty"`
 	CleanMerged string               `toml:"cleanMerged,omitempty"`
+	JiraUpdates string               `toml:"jiraUpdates,omitempty"`
 	IssueURL    string               `toml:"issueUrl,omitempty"`
 	PRURL       string               `toml:"prUrl,omitempty"`
 	URL         string               `toml:"url,omitempty"`
@@ -2042,7 +2063,7 @@ type Config struct {
 func (c *Config) settings() map[string]*string {
 	return map[string]*string{"HIRDMAN_BRIEF_EVERY": &c.BriefEvery, "HIRDMAN_JIRA_POLL": &c.JiraPoll, "HIRDMAN_GITHUB_POLL": &c.GitHubPoll,
 		"HIRDMAN_ISSUE_KEY": &c.IssueKey, "HIRDMAN_TERMINAL": &c.Terminal,
-		"HIRDMAN_SESSION_IN": &c.SessionIn, "HIRDMAN_CLEAN_MERGED": &c.CleanMerged, "HIRDMAN_ISSUE_URL": &c.IssueURL,
+		"HIRDMAN_SESSION_IN": &c.SessionIn, "HIRDMAN_CLEAN_MERGED": &c.CleanMerged, "HIRDMAN_JIRA_UPDATES": &c.JiraUpdates, "HIRDMAN_ISSUE_URL": &c.IssueURL,
 		"HIRDMAN_PR_URL": &c.PRURL, "HIRDMAN_URL": &c.URL}
 }
 

@@ -133,6 +133,7 @@ takes the answer as `{"messages": [{"event_id", "body"}]}` (kith's `read_room`).
 | `issueKey` | `HIRDMAN_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the issue feeds and GitHub |
 | `issueUrl`, `prUrl` | `HIRDMAN_ISSUE_URL`, `HIRDMAN_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without their own; an area without `prUrl` first takes its folder's GitHub `origin` |
 | `cleanMerged` | `HIRDMAN_CLEAN_MERGED` | off | `"1"`: a task done with a merged pull request closes its session and removes the worktree |
+| `jiraUpdates` | `HIRDMAN_JIRA_UPDATES` | off | `"1"`: a session acting on a task with Jira keys moves them as the work goes: In Progress at the start, QA - Staging once on staging (see `jiraRule`) |
 
 The comment at the top of `main.go` documents each one in full.
 
