@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"mime/multipart"
@@ -103,10 +104,10 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, brief, "", "", "", "https://github.com/o/work/pull/", Use{}, 6 * time.Hour},
-		{"kith", "Kith", kith, defaultRoadmap, defaultRuns, "", "1h", "https://kith/issues/", "https://kith/pull/", Use{}, time.Hour},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, []Run{}, "", "", "", "https://env/pull/", Use{}, 6 * time.Hour},
-		{"personal", "Personal", "/home", defaultRoadmap, defaultRuns, "", "0", "", "https://env/pull/", Use{}, 0}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, brief, nil, nil, "", "", "https://github.com/o/work/pull/", Use{}, 6 * time.Hour},
+		{"kith", "Kith", kith, defaultRoadmap, defaultRuns, nil, nil, "1h", "https://kith/issues/", "https://kith/pull/", Use{}, time.Hour},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, []Run{}, nil, nil, "", "", "https://env/pull/", Use{}, 6 * time.Hour},
+		{"personal", "Personal", "/home", defaultRoadmap, defaultRuns, nil, nil, "0", "", "https://env/pull/", Use{}, 0}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
@@ -529,7 +530,7 @@ func TestUpdateKeepsSession(t *testing.T) {
 	dir := t.TempDir()
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
 	b.st.Tasks = map[string]*Task{"a": {ID: "a", Job: &Job{Action: "update", Status: "running", SessionID: "id-a"}}}
-	b.run(Agent{Command: "true"}, "a", dir, "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}})
+	b.run(Agent{Command: "true"}, "a", dir, "update", "x", &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a", Rules: []string{"act"}}, nil)
 	if j := b.st.Tasks["a"].Job; j.Status == "running" || j.Session != "a-act" || j.Pane != "7" || j.SessionID != "id-a" || !slices.Equal(j.Rules, []string{"act"}) {
 		t.Errorf("job after the update = %+v, want it ended, still on session a-act in pane 7 with id-a", j)
 	}
@@ -579,6 +580,50 @@ func TestCloseChecksJira(t *testing.T) {
 	}
 	if h := b.st.Tasks["no"].History; slices.ContainsFunc(h, func(e Entry) bool { return e.Kind == "qa" }) {
 		t.Errorf("a task without Jira keys got a check: %+v", h)
+	}
+}
+
+// Every task added gets a look-only agent run in its folder, whose findings go into its history; an update gets none.
+func TestCreatePreps(t *testing.T) {
+	dir := t.TempDir()
+	fake := "#!/bin/sh\npwd >> " + dir + "/ran; printf '%s' \"$2\" > " + dir + "/prompt\necho '{\"type\":\"result\",\"result\":\"main.go:1 is it\"}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "agent"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, conf: Config{Agents: map[string]Agent{"opus": {Kind: "claude-code", Command: filepath.Join(dir, "agent")}}}, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{}
+	mux := b.routes()
+	for _, path := range []string{"/api/tasks/brief", "/api/tasks/brief", "/api/tasks/mine?actor=eugene"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPut, path, strings.NewReader(`{"area":"work","title":"Look into X"}`)))
+		if rec.Code != 200 {
+			t.Fatalf("PUT %s: %d", path, rec.Code)
+		}
+	}
+	prepped := func(id string) []Entry {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		var es []Entry
+		for _, e := range b.st.Tasks[id].History {
+			if e.Kind == "prep" {
+				es = append(es, e)
+			}
+		}
+		return es
+	}
+	for i := 0; i < 100 && (len(prepped("brief")) == 0 || len(prepped("mine")) == 0); i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, id := range []string{"brief", "mine"} {
+		if es := prepped(id); len(es) != 1 || es[0].Actor != "agent" || es[0].Text != "main.go:1 is it" {
+			t.Errorf("%s: prep entries %+v, want one with the agent's findings", id, es)
+		}
+	}
+	if ran, _ := os.ReadFile(filepath.Join(dir, "ran")); string(ran) != dir+"\n"+dir+"\n" {
+		t.Errorf("agent ran %q, want twice, in the area's folder %q", ran, dir)
+	}
+	if prompt, _ := os.ReadFile(filepath.Join(dir, "prompt")); !strings.Contains(string(prompt), `"title":"Look into X"`) {
+		t.Errorf("prompt %q doesn't carry the task", prompt)
 	}
 }
 
@@ -1187,9 +1232,11 @@ func TestSaveSettings(t *testing.T) {
 	if want := (Config{GitHubPoll: "5m", Areas: []Area{{ID: "kith", Dir: "~/dev/kith", Roadmap: []string{}}}}); err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("config.toml read back %+v (%v), want %+v", got, err, want)
 	}
-	// Multi-line prompts and runs = [] (no brief) survive the round trip.
+	// Multi-line prompts, runs = [] (no brief), mcp = [] (no server), [mcp] and feeds survive the round trip.
 	b.conf.Areas[0].Runs = append(b.conf.Areas[0].Runs, Run{Builtin: "roadmap"})
-	b.conf.Areas = append(b.conf.Areas, Area{ID: "nixos", Dir: dir, Runs: []Run{}})
+	b.conf.Areas = append(b.conf.Areas, Area{ID: "nixos", Dir: dir, Runs: []Run{}, MCP: []string{},
+		Feeds: []Feed{{MCP: "kith", Tool: "read_room", Args: map[string]any{"room": "r", "limit": int64(50)}}}})
+	b.conf.MCP = map[string]MCPServer{"kith": {Command: "kith-mcp", Args: []string{"-v"}}, "atlassian": {URL: "https://mcp.example/mcp"}}
 	if code := save(`{}`); code != 202 {
 		t.Fatalf("save: %d", code)
 	}
@@ -1360,6 +1407,105 @@ func TestReportEndsJob(t *testing.T) {
 		if got, want := b.st.Tasks["t1"].Job.Status, map[bool]string{true: "running", false: "ok"}[actor == "eugene"]; rec.Code != 200 || got != want {
 			t.Errorf("%s's report: %d, job %s; want 200, job %s", actor, rec.Code, got, want)
 		}
+	}
+}
+
+// [mcp] servers are a command or a url, and what names one must find it; a feed needs a stdio server, a tool and good keys.
+func TestCheckMCP(t *testing.T) {
+	b := &Board{home: "/home"}
+	servers := map[string]MCPServer{"kith": {Command: "kith-mcp"}, "atlassian": {URL: "https://mcp.example/mcp"}}
+	ok := Config{MCP: servers, Areas: []Area{{ID: "work", Dir: "/", MCP: []string{"kith", "atlassian"},
+		Runs:  []Run{{Prompt: "p", MCP: []string{}}},
+		Feeds: []Feed{{MCP: "kith", Tool: "read_room", Args: map[string]any{"room": "r"}, Keys: `\bBE-\d+\b`}}}}}
+	if _, err := b.checkConfig(&ok); err != nil {
+		t.Fatalf("checkConfig(good) = %v", err)
+	}
+	for name, bad := range map[string]func(c *Config){
+		"server with both":     func(c *Config) { c.MCP = map[string]MCPServer{"x": {Command: "x", URL: "https://x"}} },
+		"server with neither":  func(c *Config) { c.MCP = map[string]MCPServer{"x": {Args: []string{"a"}}} },
+		"area names none":      func(c *Config) { c.Areas[0].MCP = []string{"gone"} },
+		"run names none":       func(c *Config) { c.Areas[0].Runs[0].MCP = []string{"gone"} },
+		"feed on a url server": func(c *Config) { c.Areas[0].Feeds[0].MCP = "atlassian" },
+		"feed on none":         func(c *Config) { c.Areas[0].Feeds[0].MCP = "gone" },
+		"feed without a tool":  func(c *Config) { c.Areas[0].Feeds[0].Tool = "" },
+		"feed with bad keys":   func(c *Config) { c.Areas[0].Feeds[0].Keys = "(" },
+	} {
+		c := ok
+		c.Areas = []Area{ok.Areas[0]}
+		c.Areas[0].Runs, c.Areas[0].Feeds = slices.Clone(ok.Areas[0].Runs), slices.Clone(ok.Areas[0].Feeds)
+		bad(&c)
+		if _, err := b.checkConfig(&c); err == nil {
+			t.Errorf("%s: taken", name)
+		}
+	}
+
+	// An area gets exactly its servers; none listed is the folder's own config, [] is no server at all.
+	b.conf, b.areas = ok, ok.Areas
+	if f := b.mcpFor("work"); len(f) != 3 || f[0] != "--strict-mcp-config" || f[1] != "--mcp-config" ||
+		f[2] != `{"mcpServers":{"atlassian":{"type":"http","url":"https://mcp.example/mcp"},"kith":{"type":"stdio","command":"kith-mcp"}}}` {
+		t.Errorf("mcpFor(work) = %q", f)
+	}
+	if f := b.mcpFlags([]string{}); len(f) != 3 || f[2] != `{"mcpServers":{}}` {
+		t.Errorf("mcpFlags([]) = %q, want strict with no servers", f)
+	}
+	if f := b.mcpFor("none"); f != nil {
+		t.Errorf("mcpFor(none) = %q, want no flags", f)
+	}
+}
+
+// A feed is any stdio MCP tool answering messages: its first read is a baseline, then each new message's keys reach the
+// tasks that track them.
+func TestPollFeed(t *testing.T) {
+	dir := t.TempDir()
+	answer := func(bodies ...string) {
+		var msgs []map[string]string
+		for i, body := range bodies {
+			msgs = append(msgs, map[string]string{"event_id": fmt.Sprint("e", i), "body": body})
+		}
+		text, err := json.Marshal(map[string]any{"messages": msgs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		line, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": string(text)}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "answer"), append(line, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The server's args come from [mcp]; the tool call, as it arrives, is kept in call.
+	server := "#!/bin/sh\n[ \"$1\" = --flag ] || exit 1\nwhile read -r line; do case \"$line\" in\n" +
+		`*'"id":1'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}';;` + "\n" +
+		`*'"id":2'*) printf '%s\n' "$line" > ` + dir + `/call; cat ` + dir + `/answer;;` + "\nesac; done\n"
+	if err := os.WriteFile(filepath.Join(dir, "server"), []byte(server), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.JiraSeen = map[string][]string{}
+	b.st.Tasks = map[string]*Task{"a": {ID: "a", Jira: []string{"BE-1"}, Job: &Job{Status: "running"}}} // busy: noted, no run
+	area, feed := &Area{ID: "work"}, Feed{MCP: "x", Tool: "list", Args: map[string]any{"room": "r", "limit": 50}}
+	srv, keyRe := MCPServer{Command: filepath.Join(dir, "server"), Args: []string{"--flag"}}, regexp.MustCompile(`\bBE-\d+\b`)
+
+	answer("BE-1 moved to In Progress")
+	if err := b.pollFeed(srv, area, feed, keyRe); err != nil {
+		t.Fatal(err)
+	}
+	if call, _ := os.ReadFile(filepath.Join(dir, "call")); !strings.Contains(string(call), `"params":{"arguments":{"limit":50,"room":"r"},"name":"list"}`) {
+		t.Errorf("tool call %s, want list with the feed's args", call)
+	}
+	if h := b.st.Tasks["a"].History; len(h) != 0 {
+		t.Fatalf("baseline noted %+v, want nothing", h)
+	}
+	answer("BE-1 moved to In Progress", "BE-1 commented by Ann")
+	if err := b.pollFeed(srv, area, feed, keyRe); err != nil {
+		t.Fatal(err)
+	}
+	if h := b.st.Tasks["a"].History; len(h) != 1 || h[0].Kind != "update" || h[0].Text != "BE-1 commented by Ann" {
+		t.Errorf("history %+v, want the new message as one update", h)
+	}
+	if seen := b.st.JiraSeen[feed.id()]; !slices.Equal(seen, []string{"e0", "e1"}) {
+		t.Errorf("seen %v, want e0 e1 under the feed's id", seen)
 	}
 }
 

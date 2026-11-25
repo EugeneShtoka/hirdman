@@ -81,11 +81,11 @@ func (c *mcpConn) call(args map[string]any) (json.RawMessage, error) {
 	return c.await(2)
 }
 
-// mcpCall runs one tool call against a fresh stdio MCP server (kith-mcp) and returns its text.
-func mcpCall(server, tool string, args map[string]any) (string, error) {
+// mcpCall runs one tool call against a fresh stdio MCP server and returns its text.
+func mcpCall(server MCPServer, tool string, args map[string]any) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, server)
+	cmd := exec.CommandContext(ctx, server.Command, server.Args...) //nolint:gosec // config.toml's own server
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", tool, err)
@@ -127,13 +127,13 @@ type feedMessage struct {
 	Body    string `json:"body"`
 }
 
-// watchJira polls an area's Jira feed room and hands each new update to the agent, per ticket.
-func (b *Board) watchJira(server string, area *Area, keyRe *regexp.Regexp, every time.Duration) {
+// watchFeed polls one of an area's issue feeds and hands each new update to the agent, per issue.
+func (b *Board) watchFeed(server MCPServer, area *Area, feed Feed, keyRe *regexp.Regexp, every time.Duration) {
 	var lastOK time.Time
 	failing := false
 	for {
-		if err := b.pollJira(server, area, keyRe); err != nil {
-			log.Printf("jira feed %s: %v", area.ID, err)
+		if err := b.pollFeed(server, area, feed, keyRe); err != nil {
+			log.Printf("issue feed %s: %v", area.ID, err)
 			failing = true
 		} else {
 			if failing {
@@ -179,8 +179,8 @@ func (b *Board) briefNow(ids ...string) {
 	}
 }
 
-func (b *Board) pollJira(server string, area *Area, keyRe *regexp.Regexp) error {
-	text, err := mcpCall(server, "read_room", map[string]any{"room": area.JiraRoom, "limit": 50})
+func (b *Board) pollFeed(server MCPServer, area *Area, feed Feed, keyRe *regexp.Regexp) error {
+	text, err := mcpCall(server, feed.Tool, feed.Args)
 	if err != nil {
 		return err
 	}
@@ -188,11 +188,11 @@ func (b *Board) pollJira(server string, area *Area, keyRe *regexp.Regexp) error 
 		Messages []feedMessage `json:"messages"`
 	}
 	if err := json.Unmarshal([]byte(text), &read); err != nil {
-		return fmt.Errorf("read_room answer: %w", err)
+		return fmt.Errorf("%s answer: %w", feed.Tool, err)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	seen, ok := b.st.JiraSeen[area.JiraRoom]
+	seen, ok := b.st.JiraSeen[feed.id()]
 	baseline := !ok
 	ids := make([]string, 0, len(read.Messages))
 	byKey := map[string][]string{}
@@ -211,7 +211,7 @@ func (b *Board) pollJira(server string, area *Area, keyRe *regexp.Regexp) error 
 			}
 		}
 	}
-	b.st.JiraSeen[area.JiraRoom] = ids
+	b.st.JiraSeen[feed.id()] = ids
 	for _, key := range keys {
 		update := strings.Join(byKey[key], "\n")
 		var tracked bool
@@ -246,7 +246,7 @@ commented on or is blocked by), add it to the board with area %[4]q, in the brie
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
 Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID)
-	status, text := runAgent(b.agentFor("decide", area.ID, ""), area.Dir, prompt)
+	status, text := runAgent(b.agentFor("decide", area.ID, ""), area.Dir, prompt, b.mcpFlags(area.MCP)...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("triage", "%s (%s): %s", key, status, text)
@@ -286,8 +286,8 @@ func (b *Board) scheduleBrief() {
 // runs failed.
 func (b *Board) runBriefs(due []string) {
 	status := map[string]string{}
-	run := func(ag Agent, kind, dir, prompt string, ids ...string) {
-		s, text := runAgent(ag, dir, prompt)
+	run := func(ag Agent, kind, dir, prompt string, flags []string, ids ...string) {
+		s, text := runAgent(ag, dir, prompt, flags...)
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.logf(kind, "%s: %s", s, text)
@@ -308,12 +308,16 @@ func (b *Board) runBriefs(due []string) {
 			if r.Builtin == "roadmap" {
 				roadmap = append(roadmap, a.ID)
 			} else {
-				run(b.agentFor("headless", a.ID, r.Agent), cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, a.ID)
+				mcp := r.MCP
+				if mcp == nil {
+					mcp = a.MCP
+				}
+				run(b.agentFor("headless", a.ID, r.Agent), cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, b.mcpFlags(mcp), a.ID)
 			}
 		}
 	}
 	if prompt, ids := b.roadmapPrompt(roadmap); prompt != "" {
-		run(b.agentFor("headless", "", ""), "roadmap", b.home, prompt, ids...)
+		run(b.agentFor("headless", "", ""), "roadmap", b.home, prompt, nil, ids...)
 	}
 
 	b.mu.Lock()
@@ -924,7 +928,7 @@ func (b *Board) doneNow(t *Task) {
 		if dir, err := b.dirFor(t); err != nil {
 			b.note(t, "board", "qa", "No Jira check: "+err.Error())
 		} else {
-			go b.checkJira(b.agentFor("decide", t.Area, ""), t.ID, t.Title, dir, t.Jira)
+			go b.checkJira(b.agentFor("decide", t.Area, ""), t.ID, t.Title, dir, t.Jira, b.mcpFor(t.Area))
 		}
 	}
 	pages := taskPulls(t)
@@ -946,8 +950,8 @@ func (b *Board) doneNow(t *Task) {
 
 // checkJira runs once a task is done: a run of agent ag in the task's folder (dir) reads each of its Jira keys live and
 // moves one still before QA on, the way the qa action does, noting on task id what it found. It leaves the task's
-// session alone, so a session that closed its own task keeps working.
-func (b *Board) checkJira(ag Agent, id, title, dir string, keys []string) {
+// session alone, so a session that closed its own task keeps working. flags are the agent's, its MCP servers.
+func (b *Board) checkJira(ag Agent, id, title, dir string, keys []string, flags []string) {
 	prompt := fmt.Sprintf(`The task %[1]q on Eugene's Hirdman board (%[2]s) was just closed as done. Nobody is watching this run.
 
 Its Jira tickets should have moved on with it. Read the status of each in Jira now: %[3]s. One still before QA
@@ -957,7 +961,7 @@ Then record each key's status now:
   curl -s -X PUT %[2]s/api/tasks/%[4]s -H 'Content-Type: application/json' -d '{"jiraStatus": {"<KEY>": "<status now>"}}'
 Your final message goes into the task's history as is: one line per key, its status and whether you moved it.`,
 		title, b.selfURL, strings.Join(keys, ", "), id)
-	status, text := runAgent(ag, dir, prompt)
+	status, text := runAgent(ag, dir, prompt, flags...)
 	if status != "ok" {
 		text = "Jira check failed: " + text
 	}
@@ -967,6 +971,62 @@ Your final message goes into the task's history as is: one line per key, its sta
 		b.note(t, "agent", "qa", text)
 		b.saveOrLog()
 	}
+}
+
+// prep runs once a task is added, whoever adds it: a look-only agent run in its folder checks the story's facts and
+// gathers what deciding on it needs, and its findings go into the task's history, where the task's sessions read them.
+// One runs at a time, as a brief can add many tasks at once.
+func (b *Board) prep(id string) {
+	b.prepping.Lock()
+	defer b.prepping.Unlock()
+	area, dir, prompt := b.prepPrompt(id)
+	if prompt == "" {
+		return
+	}
+	status, text := runAgent(b.agentFor("headless", area, ""), dir, prompt)
+	if status != "ok" {
+		text = "Preprocessing failed: " + text
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t := b.st.Tasks[id]; t != nil {
+		b.note(t, "agent", "prep", text)
+		b.saveOrLog()
+	}
+}
+
+// prepPrompt is prep's area, folder and prompt for task id; no prompt for a task closed or gone before its turn.
+func (b *Board) prepPrompt(id string) (area, dir, prompt string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.st.Tasks[id]
+	if t == nil || t.Status == "done" || t.Status == "dropped" {
+		return "", "", ""
+	}
+	dir, err := b.dirFor(t)
+	var task []byte
+	if err == nil {
+		task, err = json.Marshal(t)
+	}
+	if err != nil {
+		b.note(t, "board", "prep", "No preprocessing: "+err.Error())
+		b.saveOrLog()
+		return "", "", ""
+	}
+	return t.Area, dir, fmt.Sprintf(`A task was just added to Eugene's Hirdman board (%s); its source says by whom ("" is the brief). Nobody is
+watching this run.
+
+Task:
+%s
+
+Before Eugene gets to it, do the first investigation, so deciding how to proceed is quick. Check the facts its story
+states against their sources, and find what it touches: code, config, docs, git history, open pull requests; Jira
+tickets and chat (kith) when it names or implies them; logs and databases this folder's tools and CLAUDE.md reach, with
+read-only queries; public docs when it is about an outside API or tool. Then what is already there or already tried,
+the likely approaches and their size, and what is unclear and who could answer it. Look only: change no file, write to
+no database, send no message, change nothing in Jira or on the board.
+Your final message goes into the task's history as is: the facts, with file:line, keys and links, then the open
+questions, in at most 15 short lines.`, b.selfURL, task)
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
