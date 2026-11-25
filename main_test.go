@@ -1685,3 +1685,47 @@ func TestCheckDecisions(t *testing.T) {
 		}
 	}
 }
+
+func TestMCP(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{"t1": {ID: "t1", Area: "work", Status: "doing", Urgency: "medium", Importance: "medium"}}
+	mux := b.routes()
+	call := func(body string) (int, map[string]any) {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", strings.NewReader(body)))
+		var reply map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &reply)
+		return rec.Code, reply
+	}
+	tool := func(name, args string) map[string]any {
+		_, reply := call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`)
+		res, _ := reply["result"].(map[string]any)
+		return res
+	}
+	_, init := call(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+	if res, _ := init["result"].(map[string]any); res["protocolVersion"] != "2025-06-18" || res["instructions"] != mcpInstructions {
+		t.Errorf("initialize: %v", init)
+	}
+	if code, _ := call(`{"jsonrpc":"2.0","method":"notifications/initialized"}`); code != http.StatusAccepted {
+		t.Errorf("notification: %d, want 202", code)
+	}
+	if res := tool("note_task", `{"task":"t1","text":"fixed the flake"}`); res["isError"] != false {
+		t.Errorf("note_task: %v", res)
+	}
+	if res := tool("update_task", `{"task":"t1","fields":{"status":"waiting","waitingFor":"PR review"}}`); res["isError"] != false {
+		t.Errorf("update_task: %v", res)
+	}
+	tk := b.st.Tasks["t1"]
+	if tk.Status != "waiting" || tk.WaitingFor != "PR review" || len(tk.History) != 2 ||
+		tk.History[0] != (Entry{At: tk.History[0].At, Actor: "agent", Kind: "message", Text: "fixed the flake"}) {
+		t.Errorf("task %+v", tk)
+	}
+	// A wrong id must not create a task, and a bad field is the tool's error, not the protocol's.
+	if res := tool("update_task", `{"task":"nope","fields":{"status":"done"}}`); res["isError"] != true || b.st.Tasks["nope"] != nil {
+		t.Errorf("unknown task: %v", res)
+	}
+	if res := tool("update_task", `{"task":"t1","fields":{"urgency":"asap"}}`); res["isError"] != true {
+		t.Errorf("bad field: %v", res)
+	}
+}

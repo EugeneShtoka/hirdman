@@ -42,6 +42,8 @@ import (
 	"maps"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
+
 	"net/url"
 	"os"
 	"os/exec"
@@ -1637,6 +1639,104 @@ func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// mcpInstructions reach every Claude Code session that has the board's MCP server, a resumed one too, which keeps none of
+// the hooks spawnSession gave it.
+const mcpInstructions = "Hirdman is Eugene's task board. A conversation it started on a task opens with the board's prompt, " +
+	"which names the task and its id and asks for one report. Once that report is posted the board sees nothing more of the " +
+	"conversation, whether it goes on in the board's pane or was resumed elsewhere (claude --resume, claude.ai). So from then on, " +
+	"end every turn that did more work on the task with note_task: 1-3 plain lines on what changed; and call update_task when " +
+	"its status, waitingFor or story changed. In a conversation the board did not start on a task, leave these tools alone."
+
+var mcpTools = func() []map[string]any {
+	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	tool := func(name, desc string, props map[string]any) map[string]any {
+		return map[string]any{"name": name, "description": desc, "inputSchema": map[string]any{
+			"type": "object", "properties": props, "required": slices.Sorted(maps.Keys(props))}}
+	}
+	return []map[string]any{
+		tool("note_task", "Add an entry to a Hirdman task's history.",
+			map[string]any{"task": str("the task's id"), "text": str("1-3 plain lines on what changed")}),
+		tool("update_task", "Merge fields into a Hirdman task: status (todo|doing|waiting|done|dropped), waitingFor, summary, "+
+			"triggers (replaces the task's), as the board's PUT /api/tasks/{id} does.",
+			map[string]any{"task": str("the task's id"), "fields": map[string]any{"type": "object"}}),
+	}
+}()
+
+// handleMCP serves the board as an MCP server (streamable HTTP, JSON replies only), so a session the board started can
+// still report to its task once it has left the board's hooks behind. Register it at user scope:
+// claude mcp add -s user -t http hirdman <HIRDMAN_URL>/mcp
+func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+			Name            string `json:"name"`
+			Arguments       struct {
+				Task   string          `json:"task"`
+				Text   string          `json:"text"`
+				Fields json.RawMessage `json:"fields"`
+			} `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": -32700, "message": err.Error()}})
+		return
+	}
+	if req.ID == nil { // a notification, e.g. notifications/initialized
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	reply := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+	switch p := req.Params; req.Method {
+	case "initialize":
+		reply["result"] = map[string]any{"protocolVersion": p.ProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}},
+			"serverInfo": map[string]any{"name": "hirdman", "version": "1"}, "instructions": mcpInstructions}
+	case "ping":
+		reply["result"] = map[string]any{}
+	case "tools/list":
+		reply["result"] = map[string]any{"tools": mcpTools}
+	case "tools/call":
+		text, failed := b.callTool(r.Context(), p.Name, p.Arguments.Task, p.Arguments.Text, p.Arguments.Fields)
+		reply["result"] = map[string]any{"isError": failed, "content": []any{map[string]any{"type": "text", "text": text}}}
+	default:
+		reply["error"] = map[string]any{"code": -32601, "message": "no method " + req.Method}
+	}
+	writeJSON(w, 200, reply)
+}
+
+// callTool runs an MCP tool through the API's own handlers, so it keeps their rules (history entries, the job's end,
+// field checks); it returns "ok" or what went wrong.
+func (b *Board) callTool(ctx context.Context, name, task, text string, fields json.RawMessage) (string, bool) {
+	if name != "note_task" && name != "update_task" {
+		return "no tool " + name, true
+	}
+	b.mu.Lock()
+	_, ok := b.st.Tasks[task]
+	b.mu.Unlock()
+	if !ok { // upsert would create it
+		return "no such task " + task, true
+	}
+	rec := httptest.NewRecorder()
+	if name == "note_task" {
+		body, _ := json.Marshal(map[string]string{"actor": "agent", "kind": "message", "text": text}) //nolint:errchkjson // strings only
+		b.handleNote(rec, toolRequest(ctx, task, body))
+	} else {
+		b.handleUpsert(rec, toolRequest(ctx, task, fields))
+	}
+	if rec.Code >= 400 {
+		return strings.TrimSpace(rec.Body.String()), true
+	}
+	return "ok", false
+}
+
+// toolRequest is the API request a tool call on task makes.
+func toolRequest(ctx context.Context, task string, body []byte) *http.Request {
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
+	req.SetPathValue("id", task)
+	return req
+}
+
 // continueSession types "continue" into j's session, if j is still id's running job and its session is live.
 func (b *Board) continueSession(id string, j *Job) {
 	b.mu.Lock()
@@ -1803,6 +1903,7 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/ask", b.handleAsk)
 	mux.HandleFunc("POST /api/tasks/{id}/answer", b.handleAnswer)
 	mux.HandleFunc("POST /api/tasks/{id}/session", b.handleSessionHook)
+	mux.HandleFunc("POST /mcp", b.handleMCP)
 	mux.HandleFunc("GET /api/settings", b.handleSettings)
 	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux
