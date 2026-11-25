@@ -1546,6 +1546,146 @@ func TestAgentFor(t *testing.T) {
 	}
 }
 
+// fakeModel is a decide agent answering with answer (JSON) as its result, or failing when answer is ""; its argv lands in
+// dir/args, one per line.
+func fakeModel(t *testing.T, dir, answer string) Agent {
+	t.Helper()
+	res := map[string]any{"type": "result", "result": answer, "is_error": answer == ""}
+	line, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "answer"), append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + dir + "/args\ncat " + dir + "/answer\n"
+	if err := os.WriteFile(filepath.Join(dir, "model"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return Agent{Kind: "claude-code", Command: filepath.Join(dir, "model"), Model: "haiku"}
+}
+
+// A decision goes down its chain until a tier is sure; a model that fails or is unsure passes it on, and past the last
+// tier the answer is today's.
+func TestDecide(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{home: dir}
+	waiting := &Task{ID: "a", Status: "waiting", WaitingFor: "deploy to prod"}
+	for _, c := range []struct {
+		name, q, model string
+		chain          []string
+		task           *Task
+		answer, tier   string
+	}{
+		{"model sure", "update-needs-agent", `{"answer":"note","why":"bot move","confidence":0.9}`, nil, waiting, "note", "model"},
+		{"model in a fence", "update-needs-agent", "```json\n{\"answer\":\"agent\",\"why\":\"a question\",\"confidence\":1}\n```", nil, waiting, "agent", "model"},
+		{"model unsure", "update-needs-agent", `{"answer":"note","why":"maybe","confidence":0.3}`, nil, waiting, "agent", "agent"},
+		{"model says unsure", "update-needs-agent", `{"answer":"unsure","why":"?","confidence":1}`, nil, waiting, "agent", "agent"},
+		{"model fails", "update-needs-agent", "", nil, waiting, "agent", "agent"},
+		{"model not JSON", "update-needs-agent", "note", nil, waiting, "agent", "agent"},
+		{"no tier sure", "update-needs-agent", "", []string{"model"}, waiting, "agent", "default"},
+		{"parse sure", "close-on-merge", "", nil, &Task{Status: "waiting", WaitingFor: "PR review"}, "close", "parse"},
+		{"parse unsure, model sure", "close-on-merge", `{"answer":"close","why":"deploy is automatic","confidence":0.8}`, nil, waiting, "close", "model"},
+		{"parse unsure, model fails", "close-on-merge", "", nil, waiting, "wait", "default"},
+	} {
+		b.conf = Config{Agents: map[string]Agent{"haiku": fakeModel(t, dir, c.model)}}
+		if c.chain != nil {
+			b.conf.Decisions = map[string]Chain{c.q: {By: c.chain}}
+		}
+		if d := b.decide(c.q, c.task, "BE-1 moved"); d.Answer != c.answer || d.Tier != c.tier {
+			t.Errorf("%s: decide = %+v, want %s by %s", c.name, d, c.answer, c.tier)
+		}
+	}
+	// The model gets no tools and no MCP servers, on the decide agent's model, and the context in its prompt.
+	b.conf = Config{Agents: map[string]Agent{"haiku": fakeModel(t, dir, `{"answer":"note","why":"x","confidence":1}`)}}
+	b.decide("update-needs-agent", waiting, "BE-1 commented by Ann")
+	args, err := os.ReadFile(filepath.Join(dir, "args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"\n--tools\n\n--strict-mcp-config\n", "\n--model\nhaiku\n", "Context: BE-1 commented by Ann"} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("model argv %q lacks %q", args, want)
+		}
+	}
+}
+
+// A Jira feed line on a tracked task starts the update agent only when update-needs-agent says so; the decision is noted.
+func TestOnUpdate(t *testing.T) {
+	dir := t.TempDir()
+	opus := "#!/bin/sh\necho '{\"type\":\"result\",\"result\":\"refreshed\"}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "opus"), []byte(opus), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, home: dir, areas: []Area{{ID: "work", Dir: dir}}}
+	for _, c := range []struct{ answer, job string }{{"note", ""}, {"agent", "update"}} {
+		b.conf = Config{Agents: map[string]Agent{"haiku": fakeModel(t, dir, `{"answer":"`+c.answer+`","why":"w","confidence":1}`),
+			"opus": {Kind: "claude-code", Command: filepath.Join(dir, "opus")}}}
+		b.st.Tasks = map[string]*Task{"a": {ID: "a", Area: "work", Status: "todo", Jira: []string{"BE-1"}}}
+		b.onUpdate("a", "BE-1 moved")
+		b.mu.Lock()
+		task := b.st.Tasks["a"]
+		h, job := task.History, ""
+		if task.Job != nil {
+			job = task.Job.Action
+		}
+		b.mu.Unlock()
+		if len(h) == 0 || h[0].Kind != "decision" || !strings.HasPrefix(h[0].Text, "update-needs-agent: "+c.answer+" (model)") {
+			t.Errorf("%s: history %+v, want the decision noted", c.answer, h)
+		}
+		if job != c.job {
+			t.Errorf("%s: job %q, want %q", c.answer, job, c.job)
+		}
+		for i := 0; i < 100 && job != ""; i++ { // let the update run end before the next case
+			b.mu.Lock()
+			job = b.st.Tasks["a"].Job.Status
+			b.mu.Unlock()
+			if job != "running" {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// Merged pull requests close a waiting task when close-on-merge says its wait ended with them, else it stays waiting.
+func TestSettleCloseOnMerge(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, home: dir}
+	pulls := []ghPull{{Merged: true, Shipped: true}}
+	for _, c := range []struct{ waitingFor, model, status string }{
+		{"PR review", "", "done"},
+		{"deploy to prod", `{"answer":"close","why":"deploys on merge","confidence":0.9}`, "done"},
+		{"deploy to prod", `{"answer":"wait","why":"manual deploy","confidence":0.9}`, "waiting"},
+		{"deploy to prod", "", "waiting"},
+	} {
+		b.conf = Config{Agents: map[string]Agent{"haiku": fakeModel(t, dir, c.model)}}
+		b.st.Tasks = map[string]*Task{"a": {ID: "a", Status: "waiting", WaitingFor: c.waitingFor}}
+		b.settle("a", pulls)
+		if task := b.st.Tasks["a"]; task.Status != c.status || task.History[0].Kind != "decision" {
+			t.Errorf("%q / %s: status %s, history %+v, want %s after a decision", c.waitingFor, c.model, task.Status, task.History, c.status)
+		}
+	}
+}
+
+// [decisions] names known questions and tiers; the agent tier only where the question hands work to an agent.
+func TestCheckDecisions(t *testing.T) {
+	b := &Board{home: "/home"}
+	if _, err := b.checkConfig(&Config{Decisions: map[string]Chain{"update-needs-agent": {By: []string{"parse", "model", "agent"}},
+		"close-on-merge": {By: []string{"parse"}}}}); err != nil {
+		t.Errorf("checkConfig(good) = %v", err)
+	}
+	for _, bad := range []map[string]Chain{
+		{"nope": {By: []string{"model"}}},
+		{"update-needs-agent": {By: []string{"guess"}}},
+		{"close-on-merge": {By: []string{"parse", "agent"}}},
+	} {
+		if _, err := b.checkConfig(&Config{Decisions: bad}); err == nil {
+			t.Errorf("checkConfig(%v) took it", bad)
+		}
+	}
+}
+
 func TestMCP(t *testing.T) {
 	dir := t.TempDir()
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
