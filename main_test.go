@@ -1315,6 +1315,27 @@ func TestPromptSendsOnlyItsRule(t *testing.T) {
 	}
 }
 
+func TestPromptJiraRule(t *testing.T) {
+	for _, c := range []struct {
+		jira   bool
+		keys   []string
+		action string
+		want   bool
+	}{
+		{true, []string{"BE-1"}, "act", true}, {true, []string{"BE-1"}, "trigger", true},
+		{true, []string{"BE-1"}, "update", false}, {true, nil, "act", false}, {false, []string{"BE-1"}, "act", false},
+	} {
+		b := &Board{selfURL: "http://board", jira: c.jira}
+		p, err := b.prompt(&Task{ID: "x", Jira: c.keys}, actRequest{Action: c.action})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(p, jiraRule); got != c.want {
+			t.Errorf("jira %v, keys %v, %s: has the Jira rule %v, want %v", c.jira, c.keys, c.action, got, c.want)
+		}
+	}
+}
+
 func TestHandleCombine(t *testing.T) {
 	dir := t.TempDir()
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
