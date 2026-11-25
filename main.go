@@ -282,8 +282,8 @@ func (a Agent) argv(flags ...string) []string {
 }
 
 // Use names, from [agents], the agent each job runs on: Session, the session a button opens (code investigation and
-// implementation); Headless, a brief's runs, a new task's prep and a Jira update's refresh of its task; Decide, the light
-// headless jobs: the model tier of decide, a Jira triage and the Jira check of a closed task. An area's empty one is the
+// implementation); Headless, a brief's runs, a new task's prep, a Jira update's refresh of its task and a Jira triage the
+// model tier passed on; Decide, the light headless jobs: the model tier of decide and the Jira check of a closed task. An area's empty one is the
 // board's, and the board's is defaultUse's.
 type Use struct {
 	Session  string `json:"session,omitempty" toml:"session,omitempty"`
@@ -328,7 +328,8 @@ type Chain struct {
 }
 
 // defaultDecisions are what config.toml's own [decisions] override, question by question.
-var defaultDecisions = map[string]Chain{"update-needs-agent": {By: []string{"model", "agent"}}, "close-on-merge": {By: []string{"parse", "model"}}}
+var defaultDecisions = map[string]Chain{"update-needs-agent": {By: []string{"model", "agent"}}, "close-on-merge": {By: []string{"parse", "model"}},
+	"triage": {By: []string{"model", "agent"}}}
 
 // chain is the tiers that answer question q.
 func (b *Board) chain(q string) []string {
