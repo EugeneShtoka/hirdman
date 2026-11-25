@@ -1669,6 +1669,34 @@ func TestOnUpdate(t *testing.T) {
 	}
 }
 
+// An untracked key the model is sure is not Eugene's is dropped from the feed text alone; any other goes to the headless
+// agent, which looks it up in Jira. Both are logged with the decision.
+func TestTriageKey(t *testing.T) {
+	dir := t.TempDir()
+	opus := "#!/bin/sh\ntouch " + dir + "/ran\necho '{\"type\":\"result\",\"result\":\"added\"}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "opus"), []byte(opus), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	area := &Area{ID: "work", Dir: dir}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, home: dir, areas: []Area{*area}, triage: make(chan struct{}, 1)}
+	for _, c := range []struct {
+		model, log string
+		ran        bool
+	}{
+		{`{"answer":"drop","why":"Ann's ticket","confidence":0.9}`, "BE-1: triage: drop (model) Ann's ticket", false},
+		{`{"answer":"agent","why":"assigned to Eugene","confidence":0.9}`, "BE-1: triage: agent (model) assigned to Eugene; agent (ok): added", true},
+		{`{"answer":"drop","why":"maybe","confidence":0.3}`, "BE-1: triage: agent (agent)", true},
+	} {
+		_ = os.Remove(filepath.Join(dir, "ran"))
+		b.conf = Config{Agents: map[string]Agent{"haiku": fakeModel(t, dir, c.model), "opus": {Kind: "claude-code", Command: filepath.Join(dir, "opus")}}}
+		b.triageKey(area, "BE-1", "BE-1 moved by Ann")
+		_, err := os.Stat(filepath.Join(dir, "ran"))
+		if log := b.st.Log[len(b.st.Log)-1].Text; !strings.HasPrefix(log, c.log) || (err == nil) != c.ran {
+			t.Errorf("%s: log %q, agent ran %v; want %q, %v", c.model, log, err == nil, c.log, c.ran)
+		}
+	}
+}
+
 // Merged pull requests close a waiting task when close-on-merge says its wait ended with them, else it stays waiting.
 func TestSettleCloseOnMerge(t *testing.T) {
 	dir := t.TempDir()
@@ -1693,7 +1721,7 @@ func TestSettleCloseOnMerge(t *testing.T) {
 func TestCheckDecisions(t *testing.T) {
 	b := &Board{home: "/home"}
 	if _, err := b.checkConfig(&Config{Decisions: map[string]Chain{"update-needs-agent": {By: []string{"parse", "model", "agent"}},
-		"close-on-merge": {By: []string{"parse"}}}}); err != nil {
+		"close-on-merge": {By: []string{"parse"}}, "triage": {By: []string{"agent"}}}}); err != nil {
 		t.Errorf("checkConfig(good) = %v", err)
 	}
 	for _, bad := range []map[string]Chain{

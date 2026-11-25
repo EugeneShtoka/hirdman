@@ -80,8 +80,9 @@ area's `use.headless`), `mcp`, `feeds`, `briefEvery`, `issueUrl`, `prUrl`, `use`
 
 Agents are `[agents.<name>]` entries of `kind = "claude-code"` (Claude Code, the only kind yet) with a `command` (default
 `claude`) and a `model` (its `--model`). `[use]` picks one per job: `session` (the sessions the buttons open: code
-investigation and implementation), `headless` (brief runs, a new task's prep, a Jira update's refresh of its task) and
-`decide` (the light headless jobs: the decisions' `model` tier, Jira triage, the Jira check of a closed task). Built in,
+investigation and implementation), `headless` (brief runs, a new task's prep, a Jira update's refresh of its task, the
+triage of an untracked ticket) and `decide` (the light headless jobs: the decisions' `model` tier, the Jira check of a
+closed task). Built in,
 and what your own entries add to or override:
 
 ```toml
@@ -103,12 +104,13 @@ decide = "haiku"
 is sure: `parse` (the board's own code), `model` (the `decide` agent, asked for a JSON answer with no tools; an answer
 below 0.7 confidence counts as unsure) and `agent` (hand it to the full agent run). A tier that fails or is unsure
 passes it on, and with none sure the board does what it did before the question existed. Each decision goes into the
-task's history with its tier and why. The questions, and their chains unless you set your own:
+task's history with its tier and why (a triage's, which has no task yet, into the board's log). The questions, and their chains unless you set your own:
 
 ```toml
 [decisions]
 update-needs-agent = { by = ["model", "agent"] } # a Jira feed line on a tracked task: a note only, or the update agent
 close-on-merge = { by = ["parse", "model"] }     # merged pull requests: done, or still waiting for more than them
+triage = { by = ["model", "agent"] }             # an untracked ticket in a feed: dropped, or the agent looks it up in Jira
 ```
 
 `[mcp.<name>]` is an MCP server: a stdio `command` (with `args`), or an HTTP `url`. An area's `mcp` lists the servers its

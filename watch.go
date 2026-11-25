@@ -232,10 +232,20 @@ func (b *Board) pollFeed(server MCPServer, area *Area, feed Feed, keyRe *regexp.
 	return b.save()
 }
 
-// triageKey asks the agent, in the area's folder, whether an untracked ticket belongs on the board, one at a time.
+// triageKey decides whether an untracked ticket belongs on the board (triage), one at a time: the model tier drops a key
+// the feed text alone shows is not Eugene's, and the rest go to the headless agent, which looks it up in the area's Jira
+// and adds it to the board when it concerns him.
 func (b *Board) triageKey(area *Area, key, update string) {
 	b.triage <- struct{}{}
 	defer func() { <-b.triage }()
+	d := b.decide("triage", &Task{Title: key, Area: area.ID, Jira: []string{key}}, update)
+	if d.Answer != "agent" {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.logf("triage", "%s: %s", key, d)
+		b.saveOrLog()
+		return
+	}
 	prompt := fmt.Sprintf(`A Jira update mentions %[1]s, which has no task on Eugene's Hirdman board (%[2]s). Nobody is watching this run.
 
 The update: %[3]s
@@ -246,10 +256,10 @@ commented on or is blocked by), add it to the board with area %[4]q, in the brie
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
 Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID)
-	status, text := runAgent(b.agentFor("decide", area.ID, ""), area.Dir, prompt, b.mcpFlags(area.MCP)...)
+	status, text := runAgent(b.agentFor("headless", area.ID, ""), area.Dir, prompt, b.mcpFlags(area.MCP)...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.logf("triage", "%s (%s): %s", key, status, text)
+	b.logf("triage", "%s: %s; agent (%s): %s", key, d, status, text)
 	b.saveOrLog()
 }
 
@@ -949,6 +959,14 @@ full run that reads the ticket in Jira and rewrites the task's story, or is the 
 the story expects, a field edit, someone else's routine comment or subtask. "agent" when it asks something of Eugene (a
 mention, a question, an assignment), or changes the ticket's status, scope or owner in a way the story does not say.`,
 		opts: []string{"note", "agent"}, agent: "agent", fallback: "agent",
+	},
+	"triage": {
+		ask: `A line from the Jira feed mentions a ticket (the task's jira) that has no task on the board yet; the task is only
+the candidate. Does the ticket belong on Eugene's board? "drop" when the line alone shows it is not his: someone else's
+ticket moved, assigned or commented on, with no mention of Eugene, no question or assignment to him. "agent" when it
+might be his (it names or asks him, assigns or reports to him, or the line does not say whose it is): the triage agent
+then looks the ticket up in Jira and adds it when it concerns him.`,
+		opts: []string{"drop", "agent"}, agent: "agent", fallback: "agent",
 	},
 	"close-on-merge": {
 		ask: `All the task's pull requests are merged or closed, and the task is waiting (waitingFor). Did that wait end with
