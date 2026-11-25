@@ -4,15 +4,16 @@
 //
 // Config: HIRDMAN_CONFIG (~/.config/hirdman/config.toml), see Config: the MCP servers, [mcp.<name>] with "command" and
 // "args" or "url", see MCPServer; the board's areas, [[areas]] with "id", "name", "dir", "roadmap", "mcp", "briefEvery",
-// "issueUrl", "prUrl", [[areas.runs]] and [[areas.feeds]], the board's areas and the folders their sessions run in;
-// roadmap: the files the roadmap run reads, see defaultRoadmap; mcp: the [mcp] servers its agents get, and only those,
-// unset is the folder's own; briefEvery: how often the area is briefed, a Go duration, default briefEvery, unset or 0
-// only by the board's button, see scheduleBrief; issueUrl / prUrl: the area's link bases, default issueUrl / prUrl; prUrl
-// first defaults to its folder's GitHub origin; runs: what its brief is, see Run; feeds: the MCP tools whose messages
-// are its issue updates, see Feed. And the board's settings, each of which its env var, set, wins over: briefEvery
-// (HIRDMAN_BRIEF_EVERY), jiraPoll (HIRDMAN_JIRA_POLL: how often feeds are read), githubPoll (HIRDMAN_GITHUB_POLL),
-// issueKey (HIRDMAN_ISSUE_KEY),
-// agent (HIRDMAN_AGENT: claude), url (HIRDMAN_URL: how the agent reaches us),
+// "issueUrl", "prUrl", [areas.use], [[areas.runs]] and [[areas.feeds]], the board's areas and the folders their sessions
+// run in; roadmap: the files the roadmap run reads, see defaultRoadmap; mcp: the [mcp] servers its agents get, and only
+// those, unset is the folder's own; briefEvery: how often the area is briefed, a Go duration, default briefEvery, unset or
+// 0 only by the board's button, see scheduleBrief; issueUrl / prUrl: the area's link bases, default issueUrl / prUrl; prUrl
+// first defaults to its folder's GitHub origin; use: the agents its jobs run on, over the board's [use]; runs: what its
+// brief is, see Run; feeds: the MCP tools whose messages are its issue updates, see Feed. [agents.<name>] and [use]: the
+// agents and which one each job runs on, see Agent and Use. And the board's settings, each of which its env var, set, wins
+// over: briefEvery (HIRDMAN_BRIEF_EVERY), jiraPoll (HIRDMAN_JIRA_POLL: how often feeds are read), githubPoll
+// (HIRDMAN_GITHUB_POLL), issueKey (HIRDMAN_ISSUE_KEY),
+// url (HIRDMAN_URL: how the agent reaches us),
 // terminal (HIRDMAN_TERMINAL: where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
 // sessionIn (HIRDMAN_SESSION_IN: tab | window: a wezterm session's new tab in the window last used, or its own window),
@@ -149,7 +150,6 @@ type Board struct {
 	logDir   string
 	st       State
 	home     string
-	agent    string
 	terminal []string // HIRDMAN_TERMINAL; empty is the wezterm mux
 	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
@@ -187,16 +187,19 @@ type Area struct {
 	BriefEvery string        `json:"briefEvery,omitempty" toml:"briefEvery,omitempty"`
 	IssueURL   string        `json:"issueUrl,omitempty" toml:"issueUrl,omitempty"`
 	PRURL      string        `json:"prUrl,omitempty" toml:"prUrl,omitempty"`
+	Use        Use           `json:"use,omitzero" toml:"use,omitempty"`
 	every      time.Duration // BriefEvery, parsed; 0 is never on schedule
 }
 
 // Run is one agent run of an area's brief: Prompt, run in the area's folder, or the built-in "roadmap" run, which keeps a
-// task per next item of the area's roadmap files. Name is what the board's log calls it. MCP, set, is the servers a prompt
-// run gets instead of its area's; the roadmap run, shared by the areas due together, gets the board's folder's own.
+// task per next item of the area's roadmap files. Name is what the board's log calls it. Agent, set, is the agent a prompt
+// runs on, over the area's use.headless. MCP, set, is the servers a prompt run gets instead of its area's; the roadmap run,
+// shared by the areas due together, gets the board's folder's own.
 type Run struct {
 	Name    string   `json:"name,omitempty" toml:"name,omitempty"`
 	Prompt  string   `json:"prompt,omitempty" toml:"prompt,omitempty"`
 	Builtin string   `json:"builtin,omitempty" toml:"builtin,omitempty"`
+	Agent   string   `json:"agent,omitempty" toml:"agent,omitempty"`
 	MCP     []string `json:"mcp" toml:"mcp"`
 }
 
@@ -256,8 +259,65 @@ func (b *Board) mcpFor(area string) []string {
 	return nil
 }
 
+// Agent is one [agents.<name>]: kind "claude-code", the only kind yet, is Claude Code, run as Command (empty is claude) on
+// Model (its --model; empty is its own default).
+type Agent struct {
+	Kind    string `toml:"kind"`
+	Command string `toml:"command,omitempty"`
+	Model   string `toml:"model,omitempty"`
+}
+
+// argv is a's command line for a job's flags.
+func (a Agent) argv(flags ...string) []string {
+	argv := slices.Concat([]string{cmp.Or(a.Command, "claude")}, flags)
+	if a.Model != "" {
+		argv = append(argv, "--model", a.Model)
+	}
+	return argv
+}
+
+// Use names, from [agents], the agent each job runs on: Session, the session a button opens (code investigation and
+// implementation); Headless, a brief's runs; Decide, the light headless jobs: a Jira triage, a Jira update's refresh of its
+// task and the Jira check of a closed task. An area's empty one is the board's, and the board's is defaultUse's.
+type Use struct {
+	Session  string `json:"session,omitempty" toml:"session,omitempty"`
+	Headless string `json:"headless,omitempty" toml:"headless,omitempty"`
+	Decide   string `json:"decide,omitempty" toml:"decide,omitempty"`
+}
+
+// defaultAgents and defaultUse are what config.toml's own [agents] and [use] add to and override: Haiku for the light jobs,
+// Opus for code.
+var (
+	defaultAgents = map[string]Agent{"haiku": {Kind: "claude-code", Model: "haiku"}, "opus": {Kind: "claude-code", Model: "opus"}}
+	defaultUse    = Use{Session: "opus", Headless: "opus", Decide: "haiku"}
+)
+
+// pick is u's agent for job: "session", "headless" or "decide".
+func (u Use) pick(job string) string {
+	switch job {
+	case "session":
+		return u.Session
+	case "headless":
+		return u.Headless
+	}
+	return u.Decide
+}
+
+// agentFor is the agent job runs on in area (an id, "" for none): run's own (a brief run's agent), else the area's use, else
+// the board's.
+func (b *Board) agentFor(job, area, run string) Agent {
+	if i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == area }); i >= 0 {
+		run = cmp.Or(run, b.areas[i].Use.pick(job))
+	}
+	name := cmp.Or(run, b.conf.Use.pick(job), defaultUse.pick(job))
+	if a, ok := b.conf.Agents[name]; ok {
+		return a
+	}
+	return defaultAgents[name]
+}
+
 // badRun says r is neither a prompt nor the roadmap run.
-func badRun(r Run) bool {
+func badRun(r Run) bool { //nolint:gocritic // slices.IndexFunc hands it by value
 	return (r.Prompt == "") == (r.Builtin == "") || r.Builtin != "" && r.Builtin != "roadmap"
 }
 
@@ -1266,7 +1326,7 @@ func (b *Board) start(t *Task, req actRequest) {
 	if err == nil && req.Action == "update" {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			go b.run(t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
+			go b.run(b.agentFor("decide", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
 			return
 		}
 	}
@@ -1286,7 +1346,8 @@ func (b *Board) start(t *Task, req actRequest) {
 		t.Job.Session = t.ID + "-" + req.Action
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, slices.Concat(b.mcpFor(t.Area), []string{idFlag, t.Job.SessionID, prompt})...)
+			t.Job.Pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, t.Job.Session,
+				slices.Concat(b.mcpFor(t.Area), []string{idFlag, t.Job.SessionID, prompt})...)
 		}
 	}
 	if err != nil {
@@ -1313,10 +1374,10 @@ func newSessionID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:])
 }
 
-// spawnSession opens an interactive agent session and returns its wezterm pane id ("" in another terminal);
+// spawnSession opens an interactive session of agent ag and returns its wezterm pane id ("" in another terminal);
 // args end the agent's argv: its MCP flags, the session id to start or resume, and the prompt.
 // In wezterm the pane closes when the agent exits, so a live pane means a live session.
-func (b *Board) spawnSession(dir, id, name string, args ...string) (string, error) {
+func (b *Board) spawnSession(ag Agent, dir, id, name string, args ...string) (string, error) {
 	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
 	post := func(path string) string {
 		return fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/%s' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id), path)
@@ -1331,8 +1392,8 @@ func (b *Board) spawnSession(dir, id, name string, args ...string) (string, erro
 	}
 	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
 	// The agent command and the prompt reach zsh as "$0" and "$@", never as shell text.
-	session := slices.Concat([]string{"zsh", "-lic", `exec "$0" "$@"`, b.agent, "--permission-mode", "auto", "--remote-control", name, "-n", name,
-		"--settings", string(settings)}, args)
+	session := slices.Concat([]string{"zsh", "-lic", `exec "$0" "$@"`},
+		ag.argv("--permission-mode", "auto", "--remote-control", name, "-n", name, "--settings", string(settings)), args)
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
@@ -1494,7 +1555,8 @@ func (b *Board) resume(t *Task) bool {
 	dir, err := b.dirFor(t)
 	pane := ""
 	if err == nil {
-		pane, err = b.spawnSession(dir, t.ID, j.Session, slices.Concat(b.mcpFor(t.Area), []string{"--resume", j.SessionID, resumePrompt})...)
+		pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, j.Session,
+			slices.Concat(b.mcpFor(t.Area), []string{"--resume", j.SessionID, resumePrompt})...)
 	}
 	if err != nil {
 		b.note(t, "agent", "session", fmt.Sprintf("Could not resume session %q: %v", j.Session, err))
@@ -1605,10 +1667,10 @@ func (b *Board) logf(kind, format string, args ...any) {
 	}
 }
 
-// run is a Jira update's headless run in the task's folder, with the agent's flags; prev is the task's job before it, whose
-// session the task keeps for its next Act.
-func (b *Board) run(id, dir, action, prompt string, prev *Job, flags []string) {
-	status, text := runAgent(b.agent, dir, prompt, flags...)
+// run is a Jira update's headless run of agent ag in the task's folder, with the agent's flags; prev is the task's job
+// before it, whose session the task keeps for its next Act.
+func (b *Board) run(ag Agent, id, dir, action, prompt string, prev *Job, flags []string) {
+	status, text := runAgent(ag, dir, prompt, flags...)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1633,14 +1695,14 @@ type streamEvent struct {
 	IsError bool   `json:"is_error"`
 }
 
-// runAgent runs one headless agent session, with flags after its own, and returns its final message.
+// runAgent runs one headless session of agent ag, with flags after its own, and returns its final message.
 // It reads stream-json because `--output-format json` only prints at exit, and the
 // process can linger after its result (async hooks); it's killed 30s after the result.
-func runAgent(agent, dir, prompt string, flags ...string) (status, text string) {
+func runAgent(ag Agent, dir, prompt string, flags ...string) (status, text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	args := append([]string{"-p", prompt, "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"}, flags...)
-	cmd := exec.CommandContext(ctx, agent, args...) //nolint:gosec // agent is HIRDMAN_AGENT, the service's own setting
+	argv := ag.argv(append([]string{"-p", prompt, "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"}, flags...)...)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // the agent is config.toml's, the service's own setting
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "HIRDMAN=1")
 	// Own process group, so a timeout also kills its hooks and MCP servers.
@@ -1742,7 +1804,6 @@ func main() { //nolint:funlen // one setup step after another
 	b := &Board{
 		path:     path,
 		home:     home,
-		agent:    env("HIRDMAN_AGENT", "claude"),
 		terminal: strings.Fields(os.Getenv("HIRDMAN_TERMINAL")),
 		window:   os.Getenv("HIRDMAN_SESSION_IN") == "window",
 		clean:    os.Getenv("HIRDMAN_CLEAN_MERGED") == "1",
@@ -1843,7 +1904,6 @@ type Config struct {
 	JiraPoll    string               `toml:"jiraPoll,omitempty"`
 	GitHubPoll  string               `toml:"githubPoll,omitempty"`
 	IssueKey    string               `toml:"issueKey,omitempty"`
-	Agent       string               `toml:"agent,omitempty"`
 	Terminal    string               `toml:"terminal,omitempty"`
 	SessionIn   string               `toml:"sessionIn,omitempty"`
 	CleanMerged string               `toml:"cleanMerged,omitempty"`
@@ -1851,13 +1911,15 @@ type Config struct {
 	PRURL       string               `toml:"prUrl,omitempty"`
 	URL         string               `toml:"url,omitempty"`
 	MCP         map[string]MCPServer `toml:"mcp,omitempty"`
+	Agents      map[string]Agent     `toml:"agents,omitempty"`
+	Use         Use                  `toml:"use,omitempty"`
 	Areas       []Area               `toml:"areas"`
 }
 
 // settings is c's settings by their env var: the settings page's keys, and what the rest of the board reads.
 func (c *Config) settings() map[string]*string {
 	return map[string]*string{"HIRDMAN_BRIEF_EVERY": &c.BriefEvery, "HIRDMAN_JIRA_POLL": &c.JiraPoll, "HIRDMAN_GITHUB_POLL": &c.GitHubPoll,
-		"HIRDMAN_ISSUE_KEY": &c.IssueKey, "HIRDMAN_AGENT": &c.Agent, "HIRDMAN_TERMINAL": &c.Terminal,
+		"HIRDMAN_ISSUE_KEY": &c.IssueKey, "HIRDMAN_TERMINAL": &c.Terminal,
 		"HIRDMAN_SESSION_IN": &c.SessionIn, "HIRDMAN_CLEAN_MERGED": &c.CleanMerged, "HIRDMAN_ISSUE_URL": &c.IssueURL,
 		"HIRDMAN_PR_URL": &c.PRURL, "HIRDMAN_URL": &c.URL}
 }
@@ -1980,8 +2042,8 @@ func writeConfig(path string, c *Config) error {
 	return nil
 }
 
-// checkConfig refuses what main would stop on, or read as off without a word: a bad duration, key pattern, MCP server or
-// area; it returns the areas parsed.
+// checkConfig refuses what main would stop on, or read as off without a word: a bad duration, key pattern, agent, MCP
+// server or area; it returns the areas parsed.
 func (b *Board) checkConfig(c *Config) ([]Area, error) {
 	for k, v := range map[string]string{"briefEvery": c.BriefEvery, "jiraPoll": c.JiraPoll, "githubPoll": c.GitHubPoll} {
 		if _, err := time.ParseDuration(v); v != "" && err != nil {
@@ -1993,6 +2055,31 @@ func (b *Board) checkConfig(c *Config) ([]Area, error) {
 	}
 	if c.SessionIn != "" && c.SessionIn != "tab" && c.SessionIn != "window" {
 		return nil, fmt.Errorf("sessionIn: %q, want tab or window", c.SessionIn)
+	}
+	for name, a := range c.Agents {
+		if a.Kind != "claude-code" {
+			return nil, fmt.Errorf("agents.%s: kind %q, want claude-code", name, a.Kind)
+		}
+	}
+	unknown := func(name string) bool {
+		_, ok := c.Agents[name]
+		_, def := defaultAgents[name]
+		return name != "" && !ok && !def
+	}
+	uses := map[string]Use{"use": c.Use}
+	for i := range c.Areas {
+		a := &c.Areas[i]
+		uses["areas "+a.ID+": use"] = a.Use
+		for i, r := range a.Runs {
+			uses[fmt.Sprintf("areas %s: run %d", a.ID, i+1)] = Use{Headless: r.Agent}
+		}
+	}
+	for where, u := range uses {
+		for _, name := range []string{u.Session, u.Headless, u.Decide} {
+			if unknown(name) {
+				return nil, fmt.Errorf("%s: no agent %q in [agents]", where, name)
+			}
+		}
 	}
 	areas, err := b.parseAreas(c.Areas)
 	if err != nil {
