@@ -317,6 +317,7 @@ function pills(t) {
   if (running(t)) out.push(`<span class="pill run">Agent: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.pane) out.push(`<span class="pill">session open</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
+  for (const k of t.jira || []) if ((t.jiraStatus || {})[k]) out.push(`<span class="pill">${esc(k)} ${esc(t.jiraStatus[k])}</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
   if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + (closedToday(t) ? "" : dm(t.doneAt) + " ") + hm(t.doneAt) : ""}</span>`);
   else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
