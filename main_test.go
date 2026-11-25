@@ -318,6 +318,49 @@ func TestUpsertSummaryHistory(t *testing.T) {
 	}
 }
 
+func TestSessionHost(t *testing.T) {
+	dir := t.TempDir()
+	// A host of sh commands: the session runs while dir/live exists, and what is sent lands in dir/sent.
+	h := Host{
+		Spawn:  []string{"sh", "-c", `d=$0 n=$1; shift; printf '%s\n' "$PWD" "$@" > "$d/args" && touch "$d/live" && echo "$n-id"`, "{dir}", "{name}"},
+		Alive:  []string{"sh", "-c", `test -e "$0/live" && test "$1" = s1-id`, dir, "{id}"},
+		Send:   [][]string{{"sh", "-c", `printf '%s|' "$1" >> "$0/sent"`, dir, "{text}"}, {"sh", "-c", `echo "$1" >> "$0/sent"`, dir, "{id}"}},
+		Kill:   []string{"rm", filepath.Join(dir, "live")},
+		Attach: "fake attach {id}",
+	}
+	b := &Board{selfURL: "http://board", terminal: []string{"fake"}, conf: Config{Hosts: map[string]Host{"fake": h}}}
+	if _, err := b.checkConfig(&b.conf); err != nil {
+		t.Fatalf("checkConfig(fake host) = %v", err)
+	}
+	pane, err := b.spawnSession(Agent{Command: "agent"}, dir, "t1", "s1", "do it")
+	if err != nil || pane != "s1-id" {
+		t.Fatalf("spawnSession = %q, %v; want the id the host printed", pane, err)
+	}
+	if out, _ := os.ReadFile(filepath.Join(dir, "args")); !strings.HasPrefix(string(out), "/") ||
+		!strings.Contains(string(out), "\nzsh\n-lic\nexec \"$0\" \"$@\"\nagent\n") || !strings.HasSuffix(string(out), "\ndo it\n") {
+		t.Errorf("host's spawn got\n%s\nwant the session's argv appended", out)
+	}
+	j := &Job{Pane: pane, Session: "s1"}
+	if !b.sessionPane(j) || !b.paneAlive(pane) || b.paneAlive("other") {
+		t.Errorf("live: session %v, pane %v, other %v; want true, true, false", b.sessionPane(j), b.paneAlive(pane), b.paneAlive("other"))
+	}
+	if err := b.sendText(pane, "a\nb"); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := os.ReadFile(filepath.Join(dir, "sent")); string(out) != "a\nb|s1-id\n" {
+		t.Errorf("sent %q, want the text, then its submit to the session", out)
+	}
+	if where, attach := b.where(pane); where != "fake session s1-id" || attach != "fake attach s1-id" {
+		t.Errorf("where = %q, %q", where, attach)
+	}
+	if err := b.kill(pane); err != nil || b.sessionPane(j) {
+		t.Errorf("kill = %v, session live after it: %v", err, b.sessionPane(j))
+	}
+	if _, err := b.checkConfig(&Config{Hosts: map[string]Host{"x": {Spawn: h.Spawn, Alive: h.Alive, Kill: h.Kill}}}); err == nil {
+		t.Error("checkConfig took a host that can't send")
+	}
+}
+
 func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.

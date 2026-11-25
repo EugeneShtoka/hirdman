@@ -1205,7 +1205,7 @@ questions, in at most 15 short lines.`, b.selfURL, task)
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
-// task's session (its wezterm pane, "" for none), then runs pruneWorktree in dir for each merged one,
+// task's session (its id in the session host, "" for none), then runs pruneWorktree in dir for each merged one,
 // noting on task id what it did.
 func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
 	say := func(text string) {
@@ -1234,11 +1234,12 @@ func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
 	if len(merged) == 0 {
 		return
 	}
-	if pane != "" && paneAlive(pane) {
-		if _, err := wezterm([]string{"cli", "kill-pane", "--pane-id", pane}); err != nil {
+	if pane != "" && b.paneAlive(pane) {
+		if err := b.kill(pane); err != nil {
 			log.Printf("github: clean %s: %v", id, err)
 		} else {
-			say("closed its session (wezterm pane " + pane + "): its pull request is merged")
+			where, _ := b.where(pane)
+			say("closed its session (" + where + "): its pull request is merged")
 			// shortcut: a session slower than this to exit keeps its worktree (noted as in use); poll inUse if that shows up.
 			time.Sleep(time.Second)
 		}
