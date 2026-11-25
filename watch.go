@@ -222,7 +222,7 @@ func (b *Board) pollFeed(server MCPServer, area *Area, feed Feed, keyRe *regexp.
 			tracked = true
 			b.note(t, "jira", "update", update)
 			if !b.busy(t) {
-				b.start(t, actRequest{Action: "update", Comment: update})
+				go b.onUpdate(t.ID, update)
 			}
 		}
 		if !tracked {
@@ -885,12 +885,21 @@ func settlePulls(id string, pages []string) []ghPull {
 }
 
 // settle is what done pulls make of task id, if still open: shipping while a merged one is off its default
-// branch, else a note when it waits for more than their review, else done.
+// branch, else a note when it waits for more than them (close-on-merge), else done.
 func (b *Board) settle(id string, pulls []ghPull) {
+	var d *Decision
+	if pullsShipped(pulls) {
+		if view, ok := b.snapshot(id); ok && view.Status == "waiting" {
+			d = new(b.decide("close-on-merge", &view, ""))
+		}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	// Re-checked: Eugene may have moved it while GitHub answered.
 	t := b.st.Tasks[id]
+	if t != nil && d != nil {
+		b.note(t, "board", "decision", d.String())
+	}
 	switch {
 	case t == nil || t.Status == "done" || t.Status == "dropped":
 		return
@@ -901,7 +910,7 @@ func (b *Board) settle(id string, pulls []ghPull) {
 		t.Shipping = true
 		p := &pulls[slices.IndexFunc(pulls, func(p ghPull) bool { return p.Merged && !p.Shipped })]
 		b.note(t, "github", "update", "Its pull requests are merged into "+p.Base.Ref+", not "+p.Base.Repo.DefaultBranch+" yet; checked again each poll")
-	case t.Status == "waiting" && !endsWithPulls(t.WaitingFor):
+	case t.Status == "waiting" && (d == nil || d.Answer != "close"):
 		t.Shipping = false
 		b.note(t, "github", "update", "Its pull requests are merged or closed; still waiting for "+t.WaitingFor)
 	default:
@@ -919,6 +928,154 @@ var reviewRe = regexp.MustCompile(`(?i)^(PR|pull request|review|merge)\b`)
 // task open once they merge.
 func endsWithPulls(waitingFor string) bool {
 	return waitingFor == "" || reviewRe.MatchString(waitingFor)
+}
+
+// question is one decision the board asks of decide: Ask, the model's question about the task, answered with one of Opts;
+// Parse, the Go code that answers it ("" is unsure), nil for none; Agent, the option that hands it to a full agent run,
+// "" for none; Fallback, today's answer, when no tier is sure.
+type question struct {
+	ask      string
+	opts     []string
+	parse    func(t *Task, context string) (answer, why string)
+	agent    string
+	fallback string
+}
+
+var questions = map[string]question{
+	"update-needs-agent": {
+		ask: `A line from the Jira feed arrived about one of the task's tickets (the context). Does it need the update agent, a
+full run that reads the ticket in Jira and rewrites the task's story, or is the line in the task's history enough?
+"note" when it changes nothing the story or Eugene's next step depends on: a bot or automation moving the ticket the way
+the story expects, a field edit, someone else's routine comment or subtask. "agent" when it asks something of Eugene (a
+mention, a question, an assignment), or changes the ticket's status, scope or owner in a way the story does not say.`,
+		opts: []string{"note", "agent"}, agent: "agent", fallback: "agent",
+	},
+	"close-on-merge": {
+		ask: `All the task's pull requests are merged or closed, and the task is waiting (waitingFor). Did that wait end with
+them, so the task is done ("close"), or does it wait for more: a deploy, someone's answer, a check on prod ("wait")?`,
+		opts: []string{"close", "wait"}, fallback: "wait",
+		parse: func(t *Task, _ string) (string, string) {
+			if endsWithPulls(t.WaitingFor) {
+				return "close", fmt.Sprintf("waiting for %q ends with its pull requests", t.WaitingFor)
+			}
+			return "", fmt.Sprintf("%q is not a review", t.WaitingFor)
+		},
+	},
+}
+
+// Decision is decide's answer, the tier that gave it ("default" when none was sure) and why, with the tiers before it.
+type Decision struct {
+	Question, Answer, Tier, Why string
+}
+
+func (d Decision) String() string {
+	return fmt.Sprintf("%s: %s (%s) %s", d.Question, d.Answer, d.Tier, d.Why)
+}
+
+// sure is the confidence the model tier must give to be taken.
+const sure = 0.7
+
+// decide answers question q about task t (a snapshot: decide runs without mu) and context by its chain of tiers, each
+// until one is sure: "parse", the question's Go code; "model", the area's decide agent asked for JSON, without tools;
+// "agent", the full agent run the question can hand it to. A tier that fails or is unsure passes it on; past the last,
+// the answer is the question's fallback, today's behavior.
+func (b *Board) decide(q string, t *Task, context string) Decision {
+	qu := questions[q]
+	var notes []string
+	for _, tier := range b.chain(q) {
+		var answer, why string
+		switch tier {
+		case "parse":
+			if qu.parse == nil {
+				continue
+			}
+			answer, why = qu.parse(t, context)
+		case "model":
+			var err error
+			if answer, why, err = b.askModel(&qu, t, context); err != nil {
+				answer, why = "", "failed: "+err.Error()
+			}
+		case "agent":
+			answer, why = qu.agent, "handed to the agent"
+		}
+		if slices.Contains(qu.opts, answer) {
+			return Decision{q, answer, tier, strings.Join(append(notes, why), "; ")}
+		}
+		notes = append(notes, tier+" unsure: "+why)
+	}
+	return Decision{q, qu.fallback, "default", strings.Join(append(notes, "today's behavior"), "; ")}
+}
+
+// askModel puts qu to the decide agent of t's area: one answer of qu.opts, or "" when it is unsure.
+func (b *Board) askModel(qu *question, t *Task, context string) (answer, why string, err error) {
+	view := *t
+	view.Job, view.History = nil, nil
+	task, err := json.Marshal(view)
+	if err != nil {
+		return "", "", fmt.Errorf("askModel: %w", err)
+	}
+	opts, _ := json.Marshal(qu.opts) //nolint:errchkjson // strings only
+	prompt := fmt.Sprintf(`You answer one question about a task on Eugene's Hirdman board, a task board.
+
+%s
+
+Task:
+%s
+
+Context: %s
+
+Reply with only a JSON object: {"answer": one of %s, or "unsure", "why": "<one short line>", "confidence": <0 to 1>}`,
+		qu.ask, task, cmp.Or(context, "none"), opts)
+	status, text := runAgent(b.agentFor("decide", t.Area, ""), b.home, prompt, "--tools", "", "--strict-mcp-config")
+	if status != "ok" {
+		return "", "", fmt.Errorf("askModel: %s", text)
+	}
+	var a struct {
+		Answer     string  `json:"answer"`
+		Why        string  `json:"why"`
+		Confidence float64 `json:"confidence"`
+	}
+	// The model may wrap it in a code fence.
+	if i, j := strings.Index(text, "{"), strings.LastIndex(text, "}"); i < 0 || j < i || json.Unmarshal([]byte(text[i:j+1]), &a) != nil {
+		return "", "", fmt.Errorf("askModel: not a JSON answer: %q", text)
+	}
+	if a.Confidence < sure {
+		return "", fmt.Sprintf("%s (confidence %.2f)", a.Why, a.Confidence), nil
+	}
+	return a.Answer, a.Why, nil
+}
+
+// snapshot is a copy of task id that decide can read without mu.
+func (b *Board) snapshot(id string) (Task, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var view Task
+	t := b.st.Tasks[id]
+	if t == nil {
+		return view, false
+	}
+	data, err := json.Marshal(t)
+	return view, err == nil && json.Unmarshal(data, &view) == nil
+}
+
+// onUpdate is a Jira feed line on task id, already in its history: the update agent runs when update-needs-agent says so.
+func (b *Board) onUpdate(id, update string) {
+	view, ok := b.snapshot(id)
+	if !ok {
+		return
+	}
+	d := b.decide("update-needs-agent", &view, update)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.st.Tasks[id]
+	if t == nil {
+		return
+	}
+	b.note(t, "board", "decision", d.String())
+	if d.Answer == "agent" && !b.busy(t) {
+		b.start(t, actRequest{Action: "update", Comment: update})
+	}
+	b.saveOrLog()
 }
 
 // doneNow is t moving to done: its Jira tickets are checked to have moved on too (see checkJira), and with

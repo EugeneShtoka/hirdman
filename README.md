@@ -15,8 +15,8 @@ One Go binary, standard library plus a TOML parser; the whole page is `index.htm
 - **The brief** runs on a schedule per area (`briefEvery`) or from the page: each of the area's `runs`, a prompt the
   agent runs in its folder, or the built-in roadmap run that keeps a task per next item of its roadmap files.
 - **Watchers**, each optional:
-  - Jira: reads the kith room where an area's Jira bot posts, and starts an `update` session for each changed
-    ticket.
+  - Jira: reads the kith room where an area's Jira bot posts, notes each changed ticket on its task, and starts an
+    `update` session when the line needs one (`[decisions]`).
   - GitHub: reads notifications through `gh`, links pull requests to their tasks, and settles a task once its
     pull requests are merged.
   - Triggers: a task can fire an action when a branch ships, a Jira status is reached or a time comes.
@@ -80,8 +80,9 @@ area's `use.headless`), `mcp`, `feeds`, `briefEvery`, `issueUrl`, `prUrl`, `use`
 
 Agents are `[agents.<name>]` entries of `kind = "claude-code"` (Claude Code, the only kind yet) with a `command` (default
 `claude`) and a `model` (its `--model`). `[use]` picks one per job: `session` (the sessions the buttons open: code
-investigation and implementation), `headless` (brief runs) and `decide` (the light headless jobs: Jira triage, a Jira
-update's refresh of its task, the Jira check of a closed task). Built in, and what your own entries add to or override:
+investigation and implementation), `headless` (brief runs, a new task's prep, a Jira update's refresh of its task) and
+`decide` (the light headless jobs: the decisions' `model` tier, Jira triage, the Jira check of a closed task). Built in,
+and what your own entries add to or override:
 
 ```toml
 [agents.haiku]
@@ -96,6 +97,18 @@ model = "opus"
 session = "opus"
 headless = "opus"
 decide = "haiku"
+```
+
+`[decisions]` are the questions the board decides on its own, each answered by a chain of tiers in turn (`by`) until one
+is sure: `parse` (the board's own code), `model` (the `decide` agent, asked for a JSON answer with no tools; an answer
+below 0.7 confidence counts as unsure) and `agent` (hand it to the full agent run). A tier that fails or is unsure
+passes it on, and with none sure the board does what it did before the question existed. Each decision goes into the
+task's history with its tier and why. The questions, and their chains unless you set your own:
+
+```toml
+[decisions]
+update-needs-agent = { by = ["model", "agent"] } # a Jira feed line on a tracked task: a note only, or the update agent
+close-on-merge = { by = ["parse", "model"] }     # merged pull requests: done, or still waiting for more than them
 ```
 
 `[mcp.<name>]` is an MCP server: a stdio `command` (with `args`), or an HTTP `url`. An area's `mcp` lists the servers its

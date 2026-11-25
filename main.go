@@ -10,7 +10,8 @@
 // 0 only by the board's button, see scheduleBrief; issueUrl / prUrl: the area's link bases, default issueUrl / prUrl; prUrl
 // first defaults to its folder's GitHub origin; use: the agents its jobs run on, over the board's [use]; runs: what its
 // brief is, see Run; feeds: the MCP tools whose messages are its issue updates, see Feed. [agents.<name>] and [use]: the
-// agents and which one each job runs on, see Agent and Use. And the board's settings, each of which its env var, set, wins
+// agents and which one each job runs on, see Agent and Use. [decisions]: the tiers each question the board decides on its
+// own goes through, see Chain and decide. And the board's settings, each of which its env var, set, wins
 // over: briefEvery (HIRDMAN_BRIEF_EVERY), jiraPoll (HIRDMAN_JIRA_POLL: how often feeds are read), githubPoll
 // (HIRDMAN_GITHUB_POLL), issueKey (HIRDMAN_ISSUE_KEY),
 // url (HIRDMAN_URL: how the agent reaches us),
@@ -277,8 +278,9 @@ func (a Agent) argv(flags ...string) []string {
 }
 
 // Use names, from [agents], the agent each job runs on: Session, the session a button opens (code investigation and
-// implementation); Headless, a brief's runs; Decide, the light headless jobs: a Jira triage, a Jira update's refresh of its
-// task and the Jira check of a closed task. An area's empty one is the board's, and the board's is defaultUse's.
+// implementation); Headless, a brief's runs, a new task's prep and a Jira update's refresh of its task; Decide, the light
+// headless jobs: the model tier of decide, a Jira triage and the Jira check of a closed task. An area's empty one is the
+// board's, and the board's is defaultUse's.
 type Use struct {
 	Session  string `json:"session,omitempty" toml:"session,omitempty"`
 	Headless string `json:"headless,omitempty" toml:"headless,omitempty"`
@@ -314,6 +316,22 @@ func (b *Board) agentFor(job, area, run string) Agent {
 		return a
 	}
 	return defaultAgents[name]
+}
+
+// Chain is one [decisions] entry: the tiers that answer the question in turn, each until one is sure; see decide.
+type Chain struct {
+	By []string `toml:"by"`
+}
+
+// defaultDecisions are what config.toml's own [decisions] override, question by question.
+var defaultDecisions = map[string]Chain{"update-needs-agent": {By: []string{"model", "agent"}}, "close-on-merge": {By: []string{"parse", "model"}}}
+
+// chain is the tiers that answer question q.
+func (b *Board) chain(q string) []string {
+	if c, ok := b.conf.Decisions[q]; ok {
+		return c.By
+	}
+	return defaultDecisions[q].By
 }
 
 // badRun says r is neither a prompt nor the roadmap run.
@@ -1326,7 +1344,7 @@ func (b *Board) start(t *Task, req actRequest) {
 	if err == nil && req.Action == "update" {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			go b.run(b.agentFor("decide", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
+			go b.run(b.agentFor("headless", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
 			return
 		}
 	}
@@ -1913,6 +1931,7 @@ type Config struct {
 	MCP         map[string]MCPServer `toml:"mcp,omitempty"`
 	Agents      map[string]Agent     `toml:"agents,omitempty"`
 	Use         Use                  `toml:"use,omitempty"`
+	Decisions   map[string]Chain     `toml:"decisions,omitempty"`
 	Areas       []Area               `toml:"areas"`
 }
 
@@ -2043,7 +2062,7 @@ func writeConfig(path string, c *Config) error {
 }
 
 // checkConfig refuses what main would stop on, or read as off without a word: a bad duration, key pattern, agent, MCP
-// server or area; it returns the areas parsed.
+// server, decision or area; it returns the areas parsed.
 func (b *Board) checkConfig(c *Config) ([]Area, error) {
 	for k, v := range map[string]string{"briefEvery": c.BriefEvery, "jiraPoll": c.JiraPoll, "githubPoll": c.GitHubPoll} {
 		if _, err := time.ParseDuration(v); v != "" && err != nil {
@@ -2081,11 +2100,30 @@ func (b *Board) checkConfig(c *Config) ([]Area, error) {
 			}
 		}
 	}
+	if err := checkDecisions(c); err != nil {
+		return nil, err
+	}
 	areas, err := b.parseAreas(c.Areas)
 	if err != nil {
 		return nil, err
 	}
 	return areas, checkMCP(c, areas)
+}
+
+// checkDecisions refuses a [decisions] question or tier there is none of, and the agent tier for a question no agent takes.
+func checkDecisions(c *Config) error {
+	for q, ch := range c.Decisions {
+		qu, ok := questions[q]
+		if !ok {
+			return fmt.Errorf("decisions: no question %q", q)
+		}
+		for _, tier := range ch.By {
+			if tier != "parse" && tier != "model" && tier != "agent" || tier == "agent" && qu.agent == "" {
+				return fmt.Errorf("decisions.%s: no tier %q", q, tier)
+			}
+		}
+	}
+	return nil
 }
 
 // checkMCP refuses an [mcp] server that is not a command or a url, a name of none, and a feed the board can't read.
