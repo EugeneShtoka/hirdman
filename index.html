@@ -742,7 +742,7 @@ const SETTINGS = [
   ["Briefs", [["HIRDMAN_BRIEF_EVERY", "Brief every", "How often a project without its own is briefed, e.g. 6h; empty is only by the button."]]],
   ["Watchers", [["HIRDMAN_JIRA_POLL", "Issue feed poll", "Empty is 2m."], ["HIRDMAN_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
     ["HIRDMAN_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."]]],
-  ["Sessions", [["HIRDMAN_TERMINAL", "Terminal", "Empty is the wezterm mux, else a command the session is appended to, e.g. kitty."],
+  ["Sessions", [["HIRDMAN_TERMINAL", "Terminal", "Empty is the wezterm mux; tmux, or a [hosts] entry of config.toml; else a command the session is appended to, e.g. kitty."],
     ["HIRDMAN_SESSION_IN", "A wezterm session opens in", "", [["", "A new tab"], ["window", "Its own window"]]],
     ["HIRDMAN_CLEAN_MERGED", "Clean up merged work", "A task done with a merged pull request closes its session and removes its worktree.", "check"],
     ["HIRDMAN_JIRA_UPDATES", "Move Jira with the work", "A session acting on a task moves its Jira keys: In Progress when it starts, QA - Staging once on staging.", "check"]]],

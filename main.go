@@ -10,13 +10,14 @@
 // 0 only by the board's button, see scheduleBrief; issueUrl / prUrl: the area's link bases, default issueUrl / prUrl; prUrl
 // first defaults to its folder's GitHub origin; use: the agents its jobs run on, over the board's [use]; runs: what its
 // brief is, see Run; feeds: the MCP tools whose messages are its issue updates, see Feed. [agents.<name>] and [use]: the
-// agents and which one each job runs on, see Agent and Use. [decisions]: the tiers each question the board decides on its
-// own goes through, see Chain and decide. And the board's settings, each of which its env var, set, wins
+// agents and which one each job runs on, see Agent and Use. [hosts.<name>]: terminal multiplexers sessions can run in,
+// see Host. [decisions]: the tiers each question the board decides on its own goes through, see Chain and decide. And the board's settings, each of which its env var, set, wins
 // over: briefEvery (HIRDMAN_BRIEF_EVERY), jiraPoll (HIRDMAN_JIRA_POLL: how often feeds are read), githubPoll
 // (HIRDMAN_GITHUB_POLL), issueKey (HIRDMAN_ISSUE_KEY),
 // url (HIRDMAN_URL: how the agent reaches us),
-// terminal (HIRDMAN_TERMINAL: where sessions open: unset is the wezterm mux, else a command the session is appended to,
-// run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
+// terminal (HIRDMAN_TERMINAL: where sessions open: unset or "wezterm" is the wezterm mux; a [hosts.<name>], see Host, such
+// as "tmux"; else a command the session is appended to, run in the task's folder, e.g. "kitty", "alacritty -e" or
+// "kitty @ launch --type=tab", whose sessions the board can't watch, type into or close),
 // sessionIn (HIRDMAN_SESSION_IN: tab | window: a wezterm session's new tab in the window last used, or its own window),
 // issueUrl / prUrl (HIRDMAN_ISSUE_URL / HIRDMAN_PR_URL: link bases for issue keys and #PR numbers in the page, for areas
 // without their own), cleanMerged (HIRDMAN_CLEAN_MERGED: "1": a task moving to done with a merged pull request closes its
@@ -84,7 +85,7 @@ type Job struct {
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	Session   string     `json:"session,omitempty"`   // button jobs: the agent session's name, for remote control
-	Pane      string     `json:"pane,omitempty"`      // button jobs: its wezterm pane id
+	Pane      string     `json:"pane,omitempty"`      // button jobs: its session's id in its host, a wezterm pane id by default
 	SessionID string     `json:"sessionId,omitempty"` // button jobs: the agent session's id, to resume it by; the task's next session resumes it too
 	Retries   int        `json:"retries,omitempty"`   // how often the board resumed or continued the session, see maxRetries
 	Rules     []string   `json:"rules,omitempty"`     // button jobs: the actions whose rules the session was given, so a press into it repeats none
@@ -154,7 +155,7 @@ type Board struct {
 	logDir   string
 	st       State
 	home     string
-	terminal []string // HIRDMAN_TERMINAL; empty is the wezterm mux
+	terminal []string // HIRDMAN_TERMINAL: a [hosts] name, or a command line; empty is the wezterm mux
 	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
 	triage   chan struct{}     // one Jira triage at a time
@@ -172,7 +173,7 @@ type Board struct {
 	env      map[string]string // the service's env, before config.toml; a setting it has wins over the file
 	restart  chan struct{}     // a saved setting: main restarts the board to apply it
 
-	asks map[string]chan []byte // task id -> its session's waiting question, which takes the hook's reply
+	asks map[string]chan map[string]string // task id -> its session's waiting question, which takes Eugene's answers
 }
 
 // areaRe keeps an area id a plain lowercase name.
@@ -231,9 +232,10 @@ type MCPServer struct {
 	URL     string   `toml:"url,omitempty"`
 }
 
-// mcpFlags are the agent's flags that give it exactly the [mcp] servers names lists; nil is none, the folder's own config.
-func (b *Board) mcpFlags(names []string) []string {
-	if names == nil {
+// mcpFlags are the agent's flags that give it exactly the [mcp] servers names lists, nil being the folder's own config,
+// and to a session the board's own server too (handleMCP), as hirdman.
+func (b *Board) mcpFlags(names []string, session bool) []string {
+	if names == nil && !session {
 		return nil
 	}
 	type server struct {
@@ -250,18 +252,25 @@ func (b *Board) mcpFlags(names []string) []string {
 			servers[n] = server{Type: "stdio", Command: s.Command, Args: s.Args}
 		}
 	}
+	if session {
+		servers["hirdman"] = server{Type: "http", URL: b.selfURL + "/mcp"}
+	}
 	data, _ := json.Marshal(struct { //nolint:errchkjson // strings only
 		Servers map[string]server `json:"mcpServers"`
 	}{servers})
+	if names == nil {
+		return []string{"--mcp-config", string(data)}
+	}
 	return []string{"--strict-mcp-config", "--mcp-config", string(data)}
 }
 
 // mcpFor is mcpFlags for the area id's servers.
-func (b *Board) mcpFor(area string) []string {
+func (b *Board) mcpFor(area string, session bool) []string {
+	var names []string
 	if i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == area }); i >= 0 {
-		return b.mcpFlags(b.areas[i].MCP)
+		names = b.areas[i].MCP
 	}
-	return nil
+	return b.mcpFlags(names, session)
 }
 
 // Agent is one [agents.<name>]: kind "claude-code", the only kind yet, is Claude Code, run as Command (empty is claude) on
@@ -279,6 +288,68 @@ func (a Agent) argv(flags ...string) []string {
 		argv = append(argv, "--model", a.Model)
 	}
 	return argv
+}
+
+// Host is one [hosts.<name>]: a terminal multiplexer interactive sessions run in, by its commands, each an argv whose
+// {dir}, {name}, {id} and {text} are replaced (keep {text} a whole argument: it is Eugene's words). Spawn, with the
+// session's argv appended, starts a session named {name} in folder {dir} and prints its id, none being {name}; Alive
+// exits 0 while session {id} runs; Send, one command after another, types {text} into it and submits it; Kill ends it;
+// Attach, optional, is the command line the board shows for attaching to it, from here or over ssh. Sessions outlive a
+// board restart only when the multiplexer's server runs outside the board's service.
+type Host struct {
+	Spawn  []string   `toml:"spawn"`
+	Alive  []string   `toml:"alive"`
+	Send   [][]string `toml:"send"`
+	Kill   []string   `toml:"kill"`
+	Attach string     `toml:"attach,omitempty"`
+}
+
+// defaultHosts are what config.toml's own [hosts] add to and override; wezterm, the default, is built in (see spawnSession).
+var defaultHosts = map[string]Host{"tmux": {
+	Spawn: []string{"tmux", "new-session", "-d", "-P", "-F", "#{session_name}", "-s", "{name}", "-c", "{dir}", "--"},
+	Alive: []string{"tmux", "has-session", "-t", "={id}"},
+	// A bracketed paste, so a line break in it doesn't submit early.
+	Send: [][]string{{"tmux", "set-buffer", "-b", "hirdman", "--", "{text}"}, {"tmux", "paste-buffer", "-p", "-d", "-b", "hirdman", "-t", "={id}:"},
+		{"tmux", "send-keys", "-t", "={id}:", "Enter"}},
+	Kill:   []string{"tmux", "kill-session", "-t", "={id}"},
+	Attach: "tmux attach -t ={id}",
+}}
+
+// complete reports whether h has every command the board runs.
+func (h *Host) complete() bool {
+	return len(h.Spawn) > 0 && len(h.Alive) > 0 && len(h.Send) > 0 && len(h.Kill) > 0 &&
+		!slices.ContainsFunc(h.Send, func(c []string) bool { return len(c) == 0 })
+}
+
+// spawn starts session (an argv) as name in dir and returns its id.
+func (h *Host) spawn(dir, name string, session []string) (string, error) {
+	id, err := runCmd(slices.Concat(expand(h.Spawn, "{dir}", dir, "{name}", name), session))
+	if err != nil {
+		return "", err
+	}
+	return cmp.Or(id, name), nil
+}
+
+// expand is argv with each of vars' keys ("{dir}", value, ...) replaced by its value.
+func expand(argv []string, vars ...string) []string {
+	r, out := strings.NewReplacer(vars...), make([]string, len(argv))
+	for i, a := range argv {
+		out[i] = r.Replace(a)
+	}
+	return out
+}
+
+// host is the [hosts] entry terminal names, when it names one rather than being a command line; wezterm is none.
+func (b *Board) host() (string, Host, bool) {
+	if len(b.terminal) != 1 {
+		return "", Host{}, false
+	}
+	name := b.terminal[0]
+	h, ok := b.conf.Hosts[name]
+	if !ok {
+		h, ok = defaultHosts[name]
+	}
+	return name, h, ok
 }
 
 // Use names, from [agents], the agent each job runs on: Session, the session a button opens (code investigation and
@@ -1006,29 +1077,21 @@ func union[T any](a, c []T, eq func(x, y T) bool) []T {
 	return a
 }
 
-// handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
-// holds until Eugene answers there (handleAnswer), its reply answering the tool. An empty reply hands the question to
-// the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
-func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
-	var hook struct {
-		ToolInput json.RawMessage `json:"tool_input"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil || len(hook.ToolInput) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "need a PreToolUse hook's input"})
-		return
-	}
-	id, ch := r.PathValue("id"), make(chan []byte, 1)
+// ask puts question, an AskUserQuestion input, on task id while its session waits for Eugene to answer it on the board
+// (handleAnswer), and returns his answers, none when he hands it back to the session's terminal; !ok when the task has
+// no session, a question already waits on it, or done closes first (a timeout, a board restart).
+func (b *Board) ask(done <-chan struct{}, id string, question json.RawMessage) (answers map[string]string, ok bool) {
+	ch := make(chan map[string]string, 1)
 	b.mu.Lock()
-	t, ok := b.st.Tasks[id]
-	if !ok || t.Job == nil || b.asks[id] != nil {
+	t, found := b.st.Tasks[id]
+	if !found || t.Job == nil || b.asks[id] != nil {
 		b.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-		return
+		return nil, false
 	}
 	if b.asks == nil {
-		b.asks = map[string]chan []byte{}
+		b.asks = map[string]chan map[string]string{}
 	}
-	b.asks[id], t.Job.Question = ch, hook.ToolInput
+	b.asks[id], t.Job.Question = ch, question
 	b.saveOrLog()
 	b.mu.Unlock()
 	defer func() {
@@ -1044,13 +1107,48 @@ func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
 		b.saveOrLog()
 	}()
 	select {
-	case out := <-ch:
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(out); err != nil {
-			log.Printf("ask: %v", err)
-		}
-	case <-r.Context().Done():
+	case answers = <-ch:
+		return answers, true
+	case <-done:
+		return nil, false
 	}
+}
+
+// handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
+// holds until Eugene answers there (see ask), its reply answering the tool. An empty reply hands the question to
+// the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
+func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
+	var hook struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	var input map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil || json.Unmarshal(hook.ToolInput, &input) != nil || input == nil {
+		writeJSON(w, 400, map[string]string{"error": "need a PreToolUse hook's input"})
+		return
+	}
+	answers, _ := b.ask(r.Context().Done(), r.PathValue("id"), hook.ToolInput)
+	if len(answers) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	input["answers"] = answers
+	writeJSON(w, 200, map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": input}})
+}
+
+// answerText is answers to question, an AskUserQuestion input, a line each: "question → answer".
+func answerText(question json.RawMessage, answers map[string]string) string {
+	var asked struct {
+		Questions []struct {
+			Question string `json:"question"`
+		} `json:"questions"`
+	}
+	_ = json.Unmarshal(question, &asked) // ask's callers took only an object
+	lines := make([]string, 0, len(asked.Questions))
+	for _, q := range asked.Questions {
+		lines = append(lines, q.Question+" → "+answers[q.Question])
+	}
+	return strings.Join(lines, "\n")
 }
 
 // handleAnswer answers the question a task's session waits on: {"answers": {question: answer}}, an answer being an
@@ -1073,35 +1171,11 @@ func (b *Board) handleAnswer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]string{"error": "no question is waiting on this task"})
 		return
 	}
-	var out []byte
 	text := "Answer it in the session's terminal."
 	if len(req.Answers) > 0 {
-		var input map[string]any
-		var asked struct {
-			Questions []struct {
-				Question string `json:"question"`
-			} `json:"questions"`
-		}
-		if err := json.Unmarshal(t.Job.Question, &input); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		_ = json.Unmarshal(t.Job.Question, &asked) // it parsed as input just above
-		input["answers"] = req.Answers
-		var err error
-		out, err = json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
-			"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": input}})
-		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		lines := make([]string, 0, len(asked.Questions))
-		for _, q := range asked.Questions {
-			lines = append(lines, q.Question+" → "+req.Answers[q.Question])
-		}
-		text = strings.Join(lines, "\n")
+		text = answerText(t.Job.Question, req.Answers)
 	}
-	ch <- out
+	ch <- req.Answers
 	delete(b.asks, id)
 	t.Job.Question = nil
 	b.note(t, "eugene", "answer", text)
@@ -1347,7 +1421,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 			"When the action is done, post your report once, 2-4 plain lines saying what you did, what was sent or drafted, and links; "+
 			"it goes into the task's history and marks the job finished:\n"+
 			"  jq -n --arg text '...' '{actor: \"agent\", kind: \"%[3]s\", text: $text}' | curl -s -X POST %[1]s/api/tasks/%[2]s/notes -H 'Content-Type: application/json' -d @-\n"+
-			"Then stay open for Eugene.\n", b.selfURL, t.ID, req.Action)
+			"Then stay open for Eugene. To ask him something, use the hirdman MCP server's ask_board tool with task %[2]q: he answers on the task's card.\n", b.selfURL, t.ID, req.Action)
 	}
 	return sb.String(), nil
 }
@@ -1368,16 +1442,16 @@ func (b *Board) start(t *Task, req actRequest) {
 	if err == nil && req.Action == "update" {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			go b.run(b.agentFor("headless", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area))
+			go b.run(b.agentFor("headless", t.Area, ""), t.ID, dir, req.Action, prompt, prev, b.mcpFor(t.Area, false))
 			return
 		}
 	}
 	verb := "Started"
 	switch {
 	case err != nil:
-	case !req.Fresh && sessionPane(prev):
+	case !req.Fresh && b.sessionPane(prev):
 		verb, t.Job.Session, t.Job.Pane = "Continued", prev.Session, prev.Pane
-		err = sendText(t.Job.Pane, prompt)
+		err = b.sendText(t.Job.Pane, prompt)
 	default:
 		idFlag := "--resume"
 		if t.Job.SessionID != "" {
@@ -1389,7 +1463,7 @@ func (b *Board) start(t *Task, req actRequest) {
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
 			t.Job.Pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, t.Job.Session,
-				slices.Concat(b.mcpFor(t.Area), []string{idFlag, t.Job.SessionID, prompt})...)
+				slices.Concat(b.mcpFor(t.Area, true), []string{idFlag, t.Job.SessionID, prompt})...)
 		}
 	}
 	if err != nil {
@@ -1401,11 +1475,11 @@ func (b *Board) start(t *Task, req actRequest) {
 	if !slices.Contains(t.Job.Rules, req.Action) {
 		t.Job.Rules = append(slices.Clone(t.Job.Rules), req.Action)
 	}
-	where := "your terminal"
-	if t.Job.Pane != "" {
-		where = "wezterm pane " + t.Job.Pane
+	where, attach := b.where(t.Job.Pane)
+	if attach != "" {
+		attach = " (" + attach + ")"
 	}
-	b.note(t, "agent", "session", fmt.Sprintf("%s session %q in %s: attach there, or on claude.ai/code (remote control).", verb, t.Job.Session, where))
+	b.note(t, "agent", "session", fmt.Sprintf("%s session %q in %s: attach there%s, or on claude.ai/code (remote control).", verb, t.Job.Session, where, attach))
 }
 
 // newSessionID is a random (v4) UUID, the form the agent's --session-id takes.
@@ -1416,9 +1490,10 @@ func newSessionID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:])
 }
 
-// spawnSession opens an interactive session of agent ag and returns its wezterm pane id ("" in another terminal);
+// spawnSession opens an interactive session of agent ag and returns its id in its host, a wezterm pane id by default
+// ("" in a terminal command line, which the board can't watch);
 // args end the agent's argv: its MCP flags, the session id to start or resume, and the prompt.
-// In wezterm the pane closes when the agent exits, so a live pane means a live session.
+// The session closes when the agent exits, so a live session in the host means a live agent.
 func (b *Board) spawnSession(ag Agent, dir, id, name string, args ...string) (string, error) {
 	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
 	post := func(path string) string {
@@ -1436,6 +1511,9 @@ func (b *Board) spawnSession(ag Agent, dir, id, name string, args ...string) (st
 	// The agent command and the prompt reach zsh as "$0" and "$@", never as shell text.
 	session := slices.Concat([]string{"zsh", "-lic", `exec "$0" "$@"`},
 		ag.argv("--permission-mode", "auto", "--remote-control", name, "-n", name, "--settings", string(settings)), args)
+	if _, h, ok := b.host(); ok {
+		return h.spawn(dir, name, session)
+	}
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
@@ -1461,9 +1539,14 @@ func (b *Board) spawnSession(ag Agent, dir, id, name string, args ...string) (st
 
 // wezterm runs wezterm with args and returns its trimmed output.
 func wezterm(args []string) (string, error) {
+	return runCmd(append([]string{"wezterm"}, args...))
+}
+
+// runCmd runs argv and returns its trimmed output.
+func runCmd(argv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "wezterm", args...).Output() //nolint:gosec // args are the session's, passed as argv
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output() //nolint:gosec // the board's own host commands, args passed as argv
 	if err != nil {
 		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 			return "", fmt.Errorf("spawn: %w: %s", err, strings.TrimSpace(string(ee.Stderr)))
@@ -1495,33 +1578,70 @@ func panes() (map[string]string, error) {
 	return all, nil
 }
 
-// paneAlive reports whether the wezterm mux still has pane; if the mux can't be asked, it assumes yes.
-func paneAlive(pane string) bool {
+// live asks the session host once, and returns whether a session runs as pane: the one named session, or any for "".
+// Wezterm titles a pane with its session's name, and its pane ids start over with the mux, so a bare id could be someone
+// else's pane by now; another host's session id is its own. A host that can't say for one pane counts it as live.
+func (b *Board) live() (func(pane, session string) bool, error) {
+	if _, h, ok := b.host(); ok {
+		return func(pane, _ string) bool {
+			_, err := runCmd(expand(h.Alive, "{id}", pane))
+			_, exited := errors.AsType[*exec.ExitError](err)
+			return !exited
+		}, nil
+	}
 	all, err := panes()
 	if err != nil {
-		return true
+		return nil, err
 	}
-	_, ok := all[pane]
-	return ok
+	return func(pane, session string) bool {
+		title, ok := all[pane]
+		return ok && strings.Contains(title, session)
+	}, nil
 }
 
-// sessionPane reports whether j's session is alive in its pane, which wezterm titles with the session's name:
-// pane ids start over with the mux, so a bare id could be someone else's pane by now.
-func sessionPane(j *Job) bool {
+// paneAlive reports whether the host still has pane; if the host can't be asked, it assumes yes.
+func (b *Board) paneAlive(pane string) bool {
+	live, err := b.live()
+	return err != nil || live(pane, "")
+}
+
+// sessionPane reports whether j's session is alive in its pane.
+func (b *Board) sessionPane(j *Job) bool {
 	if j == nil || j.Pane == "" {
 		return false
 	}
-	all, err := panes()
-	return err == nil && strings.Contains(all[j.Pane], j.Session)
+	live, err := b.live()
+	return err == nil && live(j.Pane, j.Session)
+}
+
+// kill ends the session in pane.
+func (b *Board) kill(pane string) error {
+	if _, h, ok := b.host(); ok {
+		_, err := runCmd(expand(h.Kill, "{id}", pane))
+		return err
+	}
+	_, err := wezterm([]string{"cli", "kill-pane", "--pane-id", pane})
+	return err
+}
+
+// where says where the session in pane runs, and how to attach to it ("" for no way the board knows).
+func (b *Board) where(pane string) (where, attach string) {
+	if name, h, ok := b.host(); ok {
+		return name + " session " + pane, strings.NewReplacer("{id}", pane).Replace(h.Attach)
+	}
+	if pane != "" {
+		return "wezterm pane " + pane, ""
+	}
+	return "your terminal", ""
 }
 
 // stopSession kills t's session pane, ending the agent in it, once Eugene closes, drops or deletes the task. Callers hold mu.
 func (b *Board) stopSession(t *Task) {
 	j := t.Job
-	if !sessionPane(j) {
+	if !b.sessionPane(j) {
 		return
 	}
-	if _, err := wezterm([]string{"cli", "kill-pane", "--pane-id", j.Pane}); err != nil {
+	if err := b.kill(j.Pane); err != nil {
 		b.note(t, "agent", "session", fmt.Sprintf("Could not stop session %q: %v", j.Session, err))
 		return
 	}
@@ -1536,13 +1656,13 @@ func (b *Board) stopSession(t *Task) {
 // not starts one; other actions wait. It returns the HTTP status for its error. Callers hold mu.
 func (b *Board) addGuidance(t *Task, req actRequest) (int, error) {
 	text := req.Comment
-	if req.Action != "act" || !sessionPane(t.Job) {
+	if req.Action != "act" || !b.sessionPane(t.Job) {
 		return 409, errors.New("busy: the agent is already working on this task")
 	}
 	if strings.TrimSpace(text) == "" {
 		return 400, errors.New("write the guidance to add to the agent's session")
 	}
-	if err := sendText(t.Job.Pane, text); err != nil {
+	if err := b.sendText(t.Job.Pane, text); err != nil {
 		return 500, err
 	}
 	b.note(t, "eugene", "message", text)
@@ -1550,7 +1670,15 @@ func (b *Board) addGuidance(t *Task, req actRequest) (int, error) {
 }
 
 // sendText types text into pane and submits it.
-func sendText(pane, text string) error {
+func (b *Board) sendText(pane, text string) error {
+	if _, h, ok := b.host(); ok {
+		for _, c := range h.Send {
+			if _, err := runCmd(expand(c, "{id}", pane, "{text}", text)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	_, err := wezterm([]string{"cli", "send-text", "--pane-id", pane, "--", text})
 	if err == nil {
 		_, err = wezterm([]string{"cli", "send-text", "--pane-id", pane, "--no-paste", "\r"})
@@ -1578,7 +1706,7 @@ func (b *Board) busy(t *Task) bool {
 	if t.Job == nil || t.Job.Status != "running" {
 		return false
 	}
-	if t.Job.Pane == "" || paneAlive(t.Job.Pane) || b.resume(t) {
+	if t.Job.Pane == "" || b.paneAlive(t.Job.Pane) || b.resume(t) {
 		return true
 	}
 	now := time.Now()
@@ -1598,7 +1726,7 @@ func (b *Board) resume(t *Task) bool {
 	pane := ""
 	if err == nil {
 		pane, err = b.spawnSession(b.agentFor("session", t.Area, ""), dir, t.ID, j.Session,
-			slices.Concat(b.mcpFor(t.Area), []string{"--resume", j.SessionID, resumePrompt})...)
+			slices.Concat(b.mcpFor(t.Area, true), []string{"--resume", j.SessionID, resumePrompt})...)
 	}
 	if err != nil {
 		b.note(t, "agent", "session", fmt.Sprintf("Could not resume session %q: %v", j.Session, err))
@@ -1606,7 +1734,8 @@ func (b *Board) resume(t *Task) bool {
 	}
 	j.Pane = pane
 	j.Retries++
-	b.note(t, "agent", "session", fmt.Sprintf("Session %q closed before reporting back; resumed it in wezterm pane %s.", j.Session, pane))
+	where, _ := b.where(pane)
+	b.note(t, "agent", "session", fmt.Sprintf("Session %q closed before reporting back; resumed it in %s.", j.Session, where))
 	return true
 }
 
@@ -1667,7 +1796,8 @@ const mcpInstructions = "Hirdman is Eugene's task board. A conversation it start
 	"which names the task and its id and asks for one report. Once that report is posted the board sees nothing more of the " +
 	"conversation, whether it goes on in the board's pane or was resumed elsewhere (claude --resume, claude.ai). So from then on, " +
 	"end every turn that did more work on the task with note_task: 1-3 plain lines on what changed; and call update_task when " +
-	"its status, waitingFor or story changed. In a conversation the board did not start on a task, leave these tools alone."
+	"its status, waitingFor or story changed. To ask Eugene something on the task, use ask_board: he answers on the board. " +
+	"In a conversation the board did not start on a task, leave these tools alone."
 
 var mcpTools = func() []map[string]any {
 	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
@@ -1681,11 +1811,83 @@ var mcpTools = func() []map[string]any {
 		tool("update_task", "Merge fields into a Hirdman task: status (todo|doing|waiting|done|dropped), waitingFor, summary, "+
 			"triggers (replaces the task's), as the board's PUT /api/tasks/{id} does.",
 			map[string]any{"task": str("the task's id"), "fields": map[string]any{"type": "object"}}),
+		{"name": "ask_board", "description": "Ask Eugene on a Hirdman task's card, as AskUserQuestion asks in the terminal, while " +
+			"the board's session on it runs: the call waits until he answers there, hours maybe, and returns his answers, or says to ask in the terminal.",
+			"inputSchema": map[string]any{"type": "object", "required": []string{"task", "questions"}, "properties": map[string]any{
+				"task": str("the task's id"),
+				"questions": map[string]any{"type": "array", "minItems": 1, "maxItems": 4, "items": map[string]any{
+					"type": "object", "required": []string{"question", "header", "options"}, "properties": map[string]any{
+						"question":    str("the whole question"),
+						"header":      str("a label of at most 12 characters"),
+						"multiSelect": map[string]any{"type": "boolean"},
+						"options": map[string]any{"type": "array", "minItems": 2, "maxItems": 4, "items": map[string]any{
+							"type": "object", "required": []string{"label"},
+							"properties": map[string]any{"label": str("1-5 words"), "description": str("what picking it means")}}},
+					}}}}}},
 	}
 }()
 
-// handleMCP serves the board as an MCP server (streamable HTTP, JSON replies only), so a session the board started can
-// still report to its task once it has left the board's hooks behind. Register it at user scope:
+// progressEvery is how often ask_board tells a client that asked for progress that it still waits, so the client
+// doesn't drop a call silent for too long (Claude Code's is 5 minutes).
+var progressEvery = 30 * time.Second
+
+// callAsk answers an ask_board call (id) on task: Eugene's answers, a line each, or where to ask instead. A call with a
+// progress token gets an event stream: a progress notification every progressEvery while it waits, then the result.
+func (b *Board) callAsk(w http.ResponseWriter, r *http.Request, id json.RawMessage, task string, questions json.RawMessage, token any) {
+	type asked struct {
+		Question string            `json:"question"`
+		Options  []json.RawMessage `json:"options"`
+	}
+	var qs []asked
+	result := make(chan string, 1)
+	question, err := json.Marshal(map[string]json.RawMessage{"questions": questions})
+	if err != nil || json.Unmarshal(questions, &qs) != nil || len(qs) == 0 ||
+		slices.ContainsFunc(qs, func(q asked) bool { return q.Question == "" || len(q.Options) == 0 }) {
+		result <- "Give ask_board one or more questions, each with its options."
+	} else {
+		go func() {
+			answers, ok := b.ask(r.Context().Done(), task, question)
+			switch {
+			case !ok:
+				result <- "The board can't take this question now (no session of its own on " + task + ", or another question waits): ask in your terminal."
+			case len(answers) == 0:
+				result <- "Eugene handed this question back: ask it in your terminal."
+			default:
+				result <- answerText(question, answers)
+			}
+		}()
+	}
+	reply := func(text string) map[string]any {
+		return map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"isError": false, "content": []any{map[string]any{"type": "text", "text": text}}}}
+	}
+	if token == nil {
+		writeJSON(w, 200, reply(<-result))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	send := func(v any) {
+		data, _ := json.Marshal(v) //nolint:errchkjson // plain maps
+		if _, err := fmt.Fprintf(w, "event: message\ndata: %s\n\n", data); err == nil {
+			_ = http.NewResponseController(w).Flush()
+		}
+	}
+	tick := time.NewTicker(progressEvery)
+	defer tick.Stop()
+	for n := 1; ; n++ {
+		select {
+		case text := <-result:
+			send(reply(text))
+			return
+		case <-tick.C:
+			send(map[string]any{"jsonrpc": "2.0", "method": "notifications/progress", "params": map[string]any{
+				"progressToken": token, "progress": n, "message": "waiting for Eugene to answer on the board"}})
+		}
+	}
+}
+
+// handleMCP serves the board as an MCP server (streamable HTTP), so a session the board started can still report to its
+// task once it has left the board's hooks behind, and any agent can ask Eugene on the board. Sessions get it with their
+// MCP servers (see mcpFlags); for the others, register it at user scope:
 // claude mcp add -s user -t http hirdman <HIRDMAN_URL>/mcp
 func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -1695,10 +1897,14 @@ func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 			ProtocolVersion string `json:"protocolVersion"`
 			Name            string `json:"name"`
 			Arguments       struct {
-				Task   string          `json:"task"`
-				Text   string          `json:"text"`
-				Fields json.RawMessage `json:"fields"`
+				Task      string          `json:"task"`
+				Text      string          `json:"text"`
+				Fields    json.RawMessage `json:"fields"`
+				Questions json.RawMessage `json:"questions"`
 			} `json:"arguments"`
+			Meta struct {
+				ProgressToken any `json:"progressToken"`
+			} `json:"_meta"`
 		} `json:"params"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1719,6 +1925,10 @@ func (b *Board) handleMCP(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		reply["result"] = map[string]any{"tools": mcpTools}
 	case "tools/call":
+		if p.Name == "ask_board" {
+			b.callAsk(w, r, req.ID, p.Arguments.Task, p.Arguments.Questions, p.Meta.ProgressToken)
+			return
+		}
 		text, failed := b.callTool(r.Context(), p.Name, p.Arguments.Task, p.Arguments.Text, p.Arguments.Fields)
 		reply["result"] = map[string]any{"isError": failed, "content": []any{map[string]any{"type": "text", "text": text}}}
 	default:
@@ -1763,11 +1973,11 @@ func toolRequest(ctx context.Context, task string, body []byte) *http.Request {
 func (b *Board) continueSession(id string, j *Job) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if t, ok := b.st.Tasks[id]; !ok || t.Job != j || j.Status != "running" || !sessionPane(j) {
+	if t, ok := b.st.Tasks[id]; !ok || t.Job != j || j.Status != "running" || !b.sessionPane(j) {
 		return
 	}
 	text := fmt.Sprintf("Continued session %q.", j.Session)
-	if err := sendText(j.Pane, "continue"); err != nil {
+	if err := b.sendText(j.Pane, "continue"); err != nil {
 		text = fmt.Sprintf("Could not continue session %q: %v", j.Session, err)
 	}
 	b.note(b.st.Tasks[id], "agent", "session", text)
@@ -1777,7 +1987,7 @@ func (b *Board) continueSession(id string, j *Job) {
 // reapSessions resumes or fails every session job whose pane is gone, so the board corrects itself without waiting
 // for a button press on that task, and forgets the pane of an ended job whose session has closed since.
 func (b *Board) reapSessions() {
-	all, err := panes()
+	live, err := b.live()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	reaped := false
@@ -1788,7 +1998,7 @@ func (b *Board) reapSessions() {
 			reaped = !b.busy(t) || j.Pane != pane || reaped
 		}
 		// A session stays open after its report; once its pane is gone the task has no session to send to.
-		if err == nil && j != nil && j.Status != "running" && j.Pane != "" && !strings.Contains(all[j.Pane], j.Session) {
+		if err == nil && j != nil && j.Status != "running" && j.Pane != "" && !live(j.Pane, j.Session) {
 			j.Pane = ""
 			reaped = true
 		}
@@ -1957,6 +2167,9 @@ func main() { //nolint:funlen // one setup step after another
 		env:      base,
 		restart:  make(chan struct{}, 1),
 	}
+	if slices.Equal(b.terminal, []string{"wezterm"}) {
+		b.terminal = nil
+	}
 	if b.areas, err = b.checkConfig(&conf); err != nil {
 		log.Fatalf("%s: %v", confPath, err)
 	}
@@ -2055,6 +2268,7 @@ type Config struct {
 	URL         string               `toml:"url,omitempty"`
 	MCP         map[string]MCPServer `toml:"mcp,omitempty"`
 	Agents      map[string]Agent     `toml:"agents,omitempty"`
+	Hosts       map[string]Host      `toml:"hosts,omitempty"`
 	Use         Use                  `toml:"use,omitempty"`
 	Decisions   map[string]Chain     `toml:"decisions,omitempty"`
 	Areas       []Area               `toml:"areas"`
@@ -2199,6 +2413,11 @@ func (b *Board) checkConfig(c *Config) ([]Area, error) {
 	}
 	if c.SessionIn != "" && c.SessionIn != "tab" && c.SessionIn != "window" {
 		return nil, fmt.Errorf("sessionIn: %q, want tab or window", c.SessionIn)
+	}
+	for name, h := range c.Hosts {
+		if !h.complete() {
+			return nil, fmt.Errorf("hosts.%s: needs spawn, alive, send and kill", name)
+		}
 	}
 	for name, a := range c.Agents {
 		if a.Kind != "claude-code" {

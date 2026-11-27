@@ -256,7 +256,7 @@ commented on or is blocked by), add it to the board with area %[4]q, in the brie
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
 Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID)
-	status, text := runAgent(b.agentFor("headless", area.ID, ""), area.Dir, prompt, b.mcpFlags(area.MCP)...)
+	status, text := runAgent(b.agentFor("headless", area.ID, ""), area.Dir, prompt, b.mcpFlags(area.MCP, false)...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("triage", "%s: %s; agent (%s): %s", key, d, status, text)
@@ -322,7 +322,7 @@ func (b *Board) runBriefs(due []string) {
 				if mcp == nil {
 					mcp = a.MCP
 				}
-				run(b.agentFor("headless", a.ID, r.Agent), cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, b.mcpFlags(mcp), a.ID)
+				run(b.agentFor("headless", a.ID, r.Agent), cmp.Or(r.Name, "brief"), a.Dir, r.Prompt, b.mcpFlags(mcp, false), a.ID)
 			}
 		}
 	}
@@ -1103,7 +1103,7 @@ func (b *Board) doneNow(t *Task) {
 		if dir, err := b.dirFor(t); err != nil {
 			b.note(t, "board", "qa", "No Jira check: "+err.Error())
 		} else {
-			go b.checkJira(b.agentFor("decide", t.Area, ""), t.ID, t.Title, dir, t.Jira, b.mcpFor(t.Area))
+			go b.checkJira(b.agentFor("decide", t.Area, ""), t.ID, t.Title, dir, t.Jira, b.mcpFor(t.Area, false))
 		}
 	}
 	pages := taskPulls(t)
@@ -1205,7 +1205,7 @@ questions, in at most 15 short lines.`, b.selfURL, task)
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
-// task's session (its wezterm pane, "" for none), then runs pruneWorktree in dir for each merged one,
+// task's session (its id in the session host, "" for none), then runs pruneWorktree in dir for each merged one,
 // noting on task id what it did.
 func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
 	say := func(text string) {
@@ -1234,11 +1234,12 @@ func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
 	if len(merged) == 0 {
 		return
 	}
-	if pane != "" && paneAlive(pane) {
-		if _, err := wezterm([]string{"cli", "kill-pane", "--pane-id", pane}); err != nil {
+	if pane != "" && b.paneAlive(pane) {
+		if err := b.kill(pane); err != nil {
 			log.Printf("github: clean %s: %v", id, err)
 		} else {
-			say("closed its session (wezterm pane " + pane + "): its pull request is merged")
+			where, _ := b.where(pane)
+			say("closed its session (" + where + "): its pull request is merged")
 			// shortcut: a session slower than this to exit keeps its worktree (noted as in use); poll inUse if that shows up.
 			time.Sleep(time.Second)
 		}
